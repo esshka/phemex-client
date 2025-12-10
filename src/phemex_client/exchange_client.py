@@ -309,6 +309,24 @@ class PhemexClient:
         """
         return await self.exchange.watch_orders(symbol)
     
+    async def watch_order_book(self, symbol: str, limit: int = 5):
+        """
+        Watch orderbook via WebSocket.
+        
+        Returns current orderbook snapshot with each call.
+        The orderbook contains 'bids' and 'asks' arrays.
+        
+        Args:
+            symbol: Trading symbol
+            limit: Depth of orderbook to return
+        
+        Returns:
+            Orderbook dict with 'bids' and 'asks'.
+            bid1 = orderbook['bids'][0][0] (best bid price)
+            ask1 = orderbook['asks'][0][0] (best ask price)
+        """
+        return await self.exchange.watch_order_book(symbol, limit)
+    
     async def watch_balance(self):
         """Watch balance via WebSocket."""
         return await self.exchange.watch_balance()

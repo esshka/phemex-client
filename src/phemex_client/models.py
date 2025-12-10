@@ -1,7 +1,7 @@
 # src/phemex_client/models.py
-# Data models for ZMQ messages, positions, and order results
+# Data models for ZMQ messages, positions, orders, and chase orders
 # Provides type-safe dataclasses for all core data structures
-# RELEVANT FILES: config.py, signal_processor.py, position_manager.py
+# RELEVANT FILES: config.py, signal_processor.py, chase_order_manager.py
 
 """
 Data models for Phemex ZMQ Order Listener.
@@ -10,6 +10,8 @@ Defines:
 - ZmqMessage: Parsed ZMQ trading signal
 - PositionState: Real-time position tracking
 - OrderResult: Order execution result
+- ChaseOrderConfig: Chase order parameters
+- ChaseOrderState: Active chase order tracking
 """
 
 from dataclasses import dataclass, field
@@ -186,3 +188,54 @@ class OrderResult:
             average=order.get("average"),
             timestamp=datetime.now(timezone.utc),
         )
+
+
+@dataclass
+class ChaseOrderConfig:
+    """
+    Chase limit order configuration.
+    
+    Defines parameters for a chase order that follows market price.
+    """
+    symbol: str                      # Trading symbol (e.g., 'SOL/USDT:USDT')
+    side: str                        # 'buy' or 'sell'
+    amount: float                    # Order size in contracts
+    
+    # Chase mode: where to place the order relative to orderbook
+    # 'bid1' = at best bid (for buys wanting to be top of book)
+    # 'ask1' = at best ask (for sells wanting to be top of book)
+    # 'distance' = at fixed distance from bid1 (buys) or ask1 (sells)
+    chase_mode: str = "bid1"
+    
+    # Distance from bid1/ask1 in price units (only used in 'distance' mode)
+    # Positive = further from mid (e.g., bid1 - distance for buys)
+    price_distance: float = 0.0
+    
+    # Max price move from initial price before stopping chase (0 = no limit)
+    # If price moves beyond this, order becomes regular limit at current price
+    max_chase_distance: float = 0.0
+    
+    # Max order updates before stopping chase
+    max_retries: int = 100
+    
+    # If True, order can only reduce position (closing orders)
+    reduce_only: bool = False
+
+
+@dataclass
+class ChaseOrderState:
+    """
+    Tracks state of an active chase order.
+    
+    Used internally by ChaseOrderManager to track progress.
+    """
+    chase_id: str                    # Unique ID for this chase
+    config: ChaseOrderConfig         # Original config
+    current_order_id: Optional[str]  # Current limit order ID (may change)
+    initial_price: float             # Price when chase started
+    current_price: float             # Current order price
+    retry_count: int = 0             # Number of order updates so far
+    status: str = "active"           # 'active', 'filled', 'stopped', 'canceled'
+    fill_price: Optional[float] = None  # Final fill price if filled
+    fill_amount: float = 0.0         # Amount filled so far
+
