@@ -713,25 +713,49 @@ class ChaseOrderManager:
         # Check WebSocket order cache first
         order_update = self._order_updates.get(state.current_order_id)
         
-        # If not in WS cache, try REST API as fallback
+        # If not in WS cache, try REST API to fetch actual order status
         if not order_update:
             try:
-                open_orders = await self._client.fetch_open_orders(state.config.symbol)
-                order_ids = {o.get("id") for o in open_orders}
+                # Fetch the actual order by ID to get real status
+                order = await self._client._exchange.fetch_order(
+                    state.current_order_id,
+                    state.config.symbol,
+                )
                 
-                # If our order is not in open orders, it was filled or canceled
-                if state.current_order_id not in order_ids:
-                    # Assume filled (will be caught in _update_order if wrong)
+                status = order.get("status", "")
+                filled = float(order.get("filled", 0.0))
+                
+                logger.debug(
+                    f"[{chase_id}] Fetched order {state.current_order_id[:8]}... "
+                    f"status={status} filled={filled}"
+                )
+                
+                # Aggregate fills
+                if filled > state.fill_amount:
+                    additional = filled - state.fill_amount
+                    state.total_filled += additional
+                    state.fill_amount = filled
+                
+                # Check if actually filled
+                if status in ("closed", "filled") and filled > 0:
+                    state.fill_price = order.get("average") or state.current_price
                     logger.info(
                         f"[{chase_id}] Order {state.current_order_id[:8]}... "
-                        f"not in open orders - likely filled"
+                        f"filled: {filled} @ {state.fill_price}"
                     )
-                    state.total_filled = state.config.amount
-                    state.fill_price = state.current_price
-                    return True
+                    return state.is_fully_filled
+                
+                # Order was canceled or rejected (not filled)
+                if status in ("canceled", "rejected", "expired"):
+                    logger.warning(
+                        f"[{chase_id}] Order {state.current_order_id[:8]}... "
+                        f"was {status}, not filled"
+                    )
+                    state.current_order_id = None  # Clear so we place new order
+                    return False
                     
             except Exception as e:
-                logger.debug(f"[{chase_id}] REST fallback failed: {e}")
+                logger.debug(f"[{chase_id}] fetch_order failed: {e}")
             
             return False
         
