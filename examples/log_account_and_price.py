@@ -1,12 +1,14 @@
 # examples/log_account_and_price.py
-# Simple example to log account status and SOLUSDT perpetual price
-# Demonstrates basic Phemex client usage for fetching market data
+# Log account status, SOLUSDT price, active positions, and open orders
+# Demonstrates basic Phemex client usage for fetching account and market data
 # RELEVANT FILES: exchange_client.py, config.yml, config.py, models.py
 
 """
 Example script that logs:
 1. Account balance and status
 2. Current SOLUSDT perpetual price
+3. Active positions (with PnL)
+4. Open orders
 
 Usage:
     poetry run python examples/log_account_and_price.py
@@ -150,6 +152,107 @@ async def log_solusdt_price(client: PhemexClient) -> None:
         logger.error(f"Failed to fetch SOLUSDT price: {e}")
 
 
+async def log_active_positions(client: PhemexClient) -> None:
+    """
+    Log all active positions.
+    
+    Args:
+        client: Initialized PhemexClient instance
+    """
+    logger.info("\n" + "=" * 60)
+    logger.info("ACTIVE POSITIONS")
+    logger.info("=" * 60)
+    
+    try:
+        positions = await client.fetch_positions()
+        
+        # Filter only positions with non-zero size
+        active_positions = [
+            p for p in positions 
+            if p.get('contracts') and float(p.get('contracts', 0)) != 0
+        ]
+        
+        if not active_positions:
+            logger.info("No active positions")
+            return
+        
+        logger.info(f"Total active positions: {len(active_positions)}\n")
+        
+        for pos in active_positions:
+            symbol = pos.get('symbol', 'N/A')
+            side = pos.get('side', 'N/A')
+            contracts = pos.get('contracts', 0)
+            notional = pos.get('notional', 0)
+            entry_price = pos.get('entryPrice', 0)
+            mark_price = pos.get('markPrice', 0)
+            unrealized_pnl = pos.get('unrealizedPnl', 0)
+            percentage = pos.get('percentage', 0)
+            leverage = pos.get('leverage', 0)
+            
+            logger.info(f"Position: {symbol}")
+            logger.info(f"  Side: {side.upper()}")
+            logger.info(f"  Contracts: {contracts}")
+            logger.info(f"  Notional: ${abs(notional):.2f}")
+            logger.info(f"  Entry Price: ${entry_price:.4f}")
+            logger.info(f"  Mark Price: ${mark_price:.4f}")
+            logger.info(f"  Unrealized PnL: ${unrealized_pnl:.2f} ({percentage:.2f}%)")
+            logger.info(f"  Leverage: {leverage}x")
+            logger.info("")
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch positions: {e}")
+
+
+async def log_open_orders(client: PhemexClient) -> None:
+    """
+    Log all open orders.
+    
+    Args:
+        client: Initialized PhemexClient instance
+    """
+    logger.info("\n" + "=" * 60)
+    logger.info("OPEN ORDERS")
+    logger.info("=" * 60)
+    
+    try:
+        # Fetch open orders for SOL/USDT
+        # Phemex requires a symbol argument
+        symbol = "SOL/USDT:USDT"
+        orders = await client.fetch_open_orders(symbol)
+        
+        if not orders:
+            logger.info(f"No open orders for {symbol}")
+            return
+        
+        logger.info(f"Total open orders for {symbol}: {len(orders)}\n")
+        
+        for order in orders:
+            order_id = order.get('id', 'N/A')
+            symbol = order.get('symbol', 'N/A')
+            order_type = order.get('type', 'N/A')
+            side = order.get('side', 'N/A')
+            price = order.get('price', 0)
+            amount = order.get('amount', 0)
+            filled = order.get('filled', 0)
+            remaining = order.get('remaining', 0)
+            status = order.get('status', 'N/A')
+            
+            logger.info(f"Order: {symbol}")
+            logger.info(f"  ID: {order_id}")
+            logger.info(f"  Type: {order_type.upper()}")
+            logger.info(f"  Side: {side.upper()}")
+            logger.info(f"  Price: ${price:.4f}")
+            logger.info(f"  Amount: {amount:.4f}")
+            logger.info(f"  Filled: {filled:.4f}")
+            logger.info(f"  Remaining: {remaining:.4f}")
+            logger.info(f"  Status: {status}")
+            logger.info("")
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch open orders: {e}")
+
+
+
 async def main() -> None:
     """
     Main function that initializes the client and logs data.
@@ -178,6 +281,12 @@ async def main() -> None:
         
         # Log SOLUSDT price
         await log_solusdt_price(client)
+        
+        # Log active positions
+        await log_active_positions(client)
+        
+        # Log open orders
+        await log_open_orders(client)
         
         logger.info("\n" + "=" * 60)
         logger.info("Done!")
