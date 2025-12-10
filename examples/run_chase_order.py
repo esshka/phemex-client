@@ -136,6 +136,7 @@ async def run_chase_order() -> None:
                 logger.info(
                     f"Status: {status['status']} | "
                     f"Retries: {status['retry_count']} | "
+                    f"Filled: {status['total_filled']:.4f}/{status['amount']:.4f} | "
                     f"Price: {status['current_price']:.4f} | "
                     f"Bid1: {prices['bid1']:.4f}"
                 )

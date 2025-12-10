@@ -246,5 +246,17 @@ class ChaseOrderState:
     retry_count: int = 0             # Number of order updates so far
     status: str = "active"           # 'active', 'filled', 'stopped', 'canceled'
     fill_price: Optional[float] = None  # Final fill price if filled
-    fill_amount: float = 0.0         # Amount filled so far
+    fill_amount: float = 0.0         # Amount filled in current order
+    total_filled: float = 0.0        # TOTAL amount filled across all order updates
+    last_amend_time: float = 0.0     # Timestamp of last amend (for rate limiting)
+    
+    @property
+    def remaining_amount(self) -> float:
+        """Amount still needed to complete the chase order."""
+        return max(0.0, self.config.amount - self.total_filled)
+    
+    @property
+    def is_fully_filled(self) -> bool:
+        """Check if the total target amount has been filled."""
+        return self.total_filled >= self.config.amount
 

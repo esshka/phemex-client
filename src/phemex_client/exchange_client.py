@@ -247,6 +247,51 @@ class PhemexClient:
             logger.error(f"Cancel all orders failed for {symbol}: {e}")
             return []
     
+    async def edit_order(
+        self,
+        order_id: str,
+        symbol: str,
+        side: str,
+        amount: Optional[float] = None,
+        price: Optional[float] = None,
+        position_side: Optional[str] = None,
+    ) -> OrderResult:
+        """
+        Amend an existing order (change price and/or amount).
+        
+        More efficient than cancel+place for chase orders.
+        
+        Args:
+            order_id: ID of order to amend
+            symbol: Trading symbol
+            side: 'buy' or 'sell' (must match original order)
+            amount: New amount (optional, keeps current if None)
+            price: New price (optional, keeps current if None)
+            position_side: For hedge mode: 'long' or 'short'. None for one-way mode.
+        
+        Returns:
+            OrderResult with updated order details
+        """
+        try:
+            params = {}
+            if position_side:
+                params["posSide"] = position_side.capitalize()
+            
+            order = await self.exchange.edit_order(
+                id=order_id,
+                symbol=symbol,
+                type="limit",
+                side=side,
+                amount=amount,
+                price=price,
+                params=params,
+            )
+            logger.debug(f"Amended order {order_id}: amount={amount}, price={price}")
+            return OrderResult.from_ccxt_order(order)
+        except Exception as e:
+            logger.error(f"Edit order {order_id} failed: {e}")
+            raise
+    
     async def cancel_order(
         self,
         order_id: str,

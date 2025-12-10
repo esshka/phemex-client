@@ -19,6 +19,7 @@ Usage:
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -42,6 +43,9 @@ class ChaseOrderManager:
     
     # Minimum price change to trigger order update (avoids spam)
     MIN_PRICE_CHANGE_PCT = 0.0001  # 0.01%
+    
+    # Minimum interval between amends (seconds)
+    MIN_AMEND_INTERVAL = 1.0
     
     @classmethod
     def get_instance(cls, exchange_client: PhemexClient) -> "ChaseOrderManager":
@@ -246,6 +250,8 @@ class ChaseOrderManager:
             "retry_count": state.retry_count,
             "fill_price": state.fill_price,
             "fill_amount": state.fill_amount,
+            "total_filled": state.total_filled,
+            "remaining_amount": state.remaining_amount,
         }
     
     def get_prices(self, symbol: str) -> Optional[dict]:
@@ -317,12 +323,22 @@ class ChaseOrderManager:
                     for order in orders:
                         order_id = order.get("id")
                         if order_id:
+                            status = order.get("status")
+                            filled = order.get("filled", 0.0)
+                            
                             self._order_updates[order_id] = {
-                                "status": order.get("status"),
-                                "filled": order.get("filled", 0.0),
+                                "status": status,
+                                "filled": filled,
                                 "remaining": order.get("remaining", 0.0),
                                 "average": order.get("average"),
                             }
+                            
+                            # Log order updates for debugging
+                            if filled > 0 or status in ("closed", "filled", "canceled"):
+                                logger.info(
+                                    f"WS order update: {order_id[:8]}... "
+                                    f"status={status} filled={filled}"
+                                )
                     
                 except asyncio.CancelledError:
                     raise
@@ -410,15 +426,16 @@ class ChaseOrderManager:
                 if self._needs_update(state, target_price):
                     await self._update_order(chase_id, target_price)
                 
-                # Check if filled (uses WebSocket cache, instant)
+                # Check if filled (tries WS cache, then REST API fallback)
                 if state.current_order_id:
-                    if self._check_order_filled(chase_id):
+                    if await self._check_order_filled(chase_id):
                         state.status = "filled"
                         logger.info(f"[{chase_id}] Filled at {state.fill_price}")
                         break
                 
-                # Small delay to avoid tight loop
-                await asyncio.sleep(0.01)
+                
+                # Chase interval: 1 second between checks
+                await asyncio.sleep(1.0)
                 
         except asyncio.CancelledError:
             logger.debug(f"[{chase_id}] Chase task canceled")
@@ -451,17 +468,43 @@ class ChaseOrderManager:
         return False
     
     def _needs_update(self, state: ChaseOrderState, target_price: float) -> bool:
-        """Check if order needs to be placed/updated."""
+        """
+        Check if order needs to be placed/updated.
+        
+        Key logic: only chase when price moves AWAY from order.
+        If price moves TOWARD order, wait for fill.
+        
+        For BUY: only update if target goes UP (price moving away)
+        For SELL: only update if target goes DOWN (price moving away)
+        """
         if state.current_order_id is None:
             return True
         
         if state.current_price == 0.0:
             return True
         
-        price_change = abs(target_price - state.current_price)
+        # Rate limit: minimum 1 second between amends
+        if state.last_amend_time > 0:
+            elapsed = time.time() - state.last_amend_time
+            if elapsed < self.MIN_AMEND_INTERVAL:
+                return False
+        
+        price_diff = target_price - state.current_price
         min_change = state.current_price * self.MIN_PRICE_CHANGE_PCT
         
-        return price_change > min_change
+        # No significant change
+        if abs(price_diff) < min_change:
+            return False
+        
+        # BUY order: only chase UP (price moving away from our order)
+        # If price drops, we wait for our order to fill
+        if state.config.side == "buy":
+            return price_diff > 0  # target went UP
+        
+        # SELL order: only chase DOWN (price moving away from our order)
+        # If price rises, we wait for our order to fill
+        else:
+            return price_diff < 0  # target went DOWN
     
     def _calculate_target_price(
         self,
@@ -517,27 +560,113 @@ class ChaseOrderManager:
         return price
     
     async def _update_order(self, chase_id: str, target_price: float) -> None:
-        """Place or update the chase order."""
+        """
+        Place or update the chase order.
+        
+        Uses edit_order (amend) when an order exists to reduce latency.
+        Falls back to cancel+place if amend fails.
+        Aggregates partial fills from previous orders.
+        """
         state = self._active_chases[chase_id]
         config = state.config
         
-        # Cancel existing order
+        # Check for partial fills from WebSocket cache
+        if state.current_order_id:
+            order_update = self._order_updates.get(state.current_order_id)
+            if order_update:
+                current_filled = order_update.get("filled", 0.0)
+                if current_filled > state.fill_amount:
+                    additional_fill = current_filled - state.fill_amount
+                    state.total_filled += additional_fill
+                    state.fill_amount = current_filled
+                    logger.info(
+                        f"[{chase_id}] Partial fill: +{additional_fill:.4f}, "
+                        f"Total: {state.total_filled:.4f}/{config.amount:.4f}"
+                    )
+        
+        # Check if fully filled
+        if state.is_fully_filled:
+            state.status = "filled"
+            state.fill_price = state.current_price
+            logger.info(f"[{chase_id}] Fully filled! Total: {state.total_filled:.4f}")
+            return
+        
+        remaining = state.remaining_amount
+        if remaining <= 0:
+            state.status = "filled"
+            return
+        
+        # If order exists, try to AMEND it (single API call, lower latency)
         if state.current_order_id:
             try:
-                await self._client.cancel_order(
-                    state.current_order_id,
-                    config.symbol,
+                result = await self._client.edit_order(
+                    order_id=state.current_order_id,
+                    symbol=config.symbol,
+                    side=config.side,
+                    amount=remaining,
+                    price=target_price,
                     position_side=config.position_side,
                 )
-            except Exception:
-                pass  # May already be filled/canceled
+                
+                state.current_price = target_price
+                state.last_amend_time = time.time()
+                state.retry_count += 1
+                
+                logger.info(
+                    f"[{chase_id}] AMEND #{state.retry_count}: "
+                    f"{config.side.upper()} {remaining:.4f} @ {target_price:.4f}"
+                )
+                return
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                # ORDER_NOT_FOUND = order was already filled or canceled
+                if "ORDER_NOT_FOUND" in error_str or "10002" in error_str:
+                    order_update = self._order_updates.get(state.current_order_id)
+                    ws_has_fill = order_update and order_update.get("filled", 0.0) > 0
+                    
+                    if not ws_has_fill and state.fill_amount == 0:
+                        remaining_on_order = state.remaining_amount
+                        state.total_filled += remaining_on_order
+                        state.fill_price = state.current_price
+                        logger.info(
+                            f"[{chase_id}] Order filled (not found on amend): "
+                            f"+{remaining_on_order:.4f}, Total: {state.total_filled:.4f}"
+                        )
+                    
+                    # Clear order ID, will place new order below
+                    state.current_order_id = None
+                else:
+                    # Other amend errors - try cancel+place
+                    logger.warning(f"[{chase_id}] Amend failed, will cancel+place: {e}")
+                    try:
+                        await self._client.cancel_order(
+                            state.current_order_id,
+                            config.symbol,
+                            position_side=config.position_side,
+                        )
+                    except Exception:
+                        pass
+                    state.current_order_id = None
         
-        # Place new order
+        # Check again if fully filled after aggregating
+        if state.is_fully_filled:
+            state.status = "filled"
+            state.fill_price = state.current_price
+            return
+        
+        remaining = state.remaining_amount
+        if remaining <= 0:
+            state.status = "filled"
+            return
+        
+        # Place NEW order (no existing order or amend failed)
         try:
             result = await self._client.place_limit_post_only(
                 symbol=config.symbol,
                 side=config.side,
-                amount=config.amount,
+                amount=remaining,
                 price=target_price,
                 reduce_only=config.reduce_only,
                 position_side=config.position_side,
@@ -545,51 +674,87 @@ class ChaseOrderManager:
             
             state.current_order_id = result.order_id
             state.current_price = target_price
+            state.fill_amount = 0.0
+            state.last_amend_time = time.time()
             state.retry_count += 1
             
             logger.info(
-                f"[{chase_id}] #{state.retry_count}: "
-                f"{config.side.upper()} @ {target_price:.4f}"
+                f"[{chase_id}] NEW #{state.retry_count}: "
+                f"{config.side.upper()} {remaining:.4f} @ {target_price:.4f}"
             )
             
         except Exception as e:
-            logger.error(f"[{chase_id}] Order failed: {e}")
+            error_str = str(e)
+            
+            if "TE_REDUCE_ONLY_ABORT" in error_str or "11011" in error_str:
+                logger.info(f"[{chase_id}] Position already closed (reduce_only abort)")
+                state.status = "filled"
+                state.total_filled = config.amount
+                return
+            
+            logger.warning(f"[{chase_id}] Order failed: {e}")
+            await asyncio.sleep(0.5)
     
-    def _check_order_filled(self, chase_id: str) -> bool:
+    async def _check_order_filled(self, chase_id: str) -> bool:
         """
-        Check if current order is filled using WebSocket order cache.
+        Check if order is filled.
         
-        Uses real-time order updates instead of REST polling.
+        First checks WebSocket order cache, then falls back to REST API
+        if order is not in cache (Phemex WS can miss updates).
+        
+        Aggregates partial fills to total_filled.
+        Returns True when fully filled.
         """
         state = self._active_chases[chase_id]
         
         if not state.current_order_id:
             return False
         
-        # Check WebSocket order cache
+        # Check WebSocket order cache first
         order_update = self._order_updates.get(state.current_order_id)
         
+        # If not in WS cache, try REST API as fallback
         if not order_update:
-            return False  # No update yet
+            try:
+                open_orders = await self._client.fetch_open_orders(state.config.symbol)
+                order_ids = {o.get("id") for o in open_orders}
+                
+                # If our order is not in open orders, it was filled or canceled
+                if state.current_order_id not in order_ids:
+                    # Assume filled (will be caught in _update_order if wrong)
+                    logger.info(
+                        f"[{chase_id}] Order {state.current_order_id[:8]}... "
+                        f"not in open orders - likely filled"
+                    )
+                    state.total_filled = state.config.amount
+                    state.fill_price = state.current_price
+                    return True
+                    
+            except Exception as e:
+                logger.debug(f"[{chase_id}] REST fallback failed: {e}")
+            
+            return False
         
         status = order_update.get("status", "")
         filled = order_update.get("filled", 0.0)
         
-        # Track partial fills
-        if filled > 0:
+        # Aggregate any new fills
+        if filled > state.fill_amount:
+            additional_fill = filled - state.fill_amount
+            state.total_filled += additional_fill
             state.fill_amount = filled
         
-        # Check for full fill
-        if status == "closed" or status == "filled":
+        # Check if fully filled (considering all orders)
+        if state.is_fully_filled:
             state.fill_price = order_update.get("average") or state.current_price
-            state.fill_amount = order_update.get("filled", state.config.amount)
             return True
         
-        # Check if canceled (might have been partially filled)
-        if status == "canceled":
+        # Check for current order closed
+        if status == "closed" or status == "filled":
+            # Aggregate final fill
             if filled > 0:
-                # Partial fill
                 state.fill_price = order_update.get("average") or state.current_price
-                return True
+            # Check if this completes the total
+            return state.is_fully_filled
         
         return False
