@@ -71,14 +71,19 @@ class ChaseOrderManager:
         """
         self._client = exchange_client
         
-        # Price cache: symbol -> {bid1, ask1, timestamp}
+        # Price cache: symbol -> {bid1, bid2, ask1, ask2}
         self._prices: dict[str, dict] = {}
+        
+        # Order updates cache: order_id -> order_info
+        # Populated by WebSocket order stream for real-time fill detection
+        self._order_updates: dict[str, dict] = {}
         
         # Active chase orders
         self._active_chases: dict[str, ChaseOrderState] = {}
         
         # Background tasks
         self._orderbook_tasks: dict[str, asyncio.Task] = {}
+        self._order_stream_task: Optional[asyncio.Task] = None
         self._chase_tasks: dict[str, asyncio.Task] = {}
         
         # Command queue for submitting chase orders
@@ -114,6 +119,9 @@ class ChaseOrderManager:
             task = asyncio.create_task(self._stream_orderbook(symbol))
             self._orderbook_tasks[symbol] = task
         
+        # Start order updates stream (for fill detection)
+        self._order_stream_task = asyncio.create_task(self._stream_orders())
+        
         # Wait for initial prices
         for symbol in symbols:
             for _ in range(50):  # 5 second timeout
@@ -146,6 +154,11 @@ class ChaseOrderManager:
         for task in self._orderbook_tasks.values():
             task.cancel()
         self._orderbook_tasks.clear()
+        
+        # Cancel order stream
+        if self._order_stream_task:
+            self._order_stream_task.cancel()
+            self._order_stream_task = None
         
         # Cancel command processor
         if self._command_processor_task:
@@ -287,6 +300,40 @@ class ChaseOrderManager:
         
         logger.debug(f"Orderbook stream stopped for {symbol}")
     
+    async def _stream_orders(self) -> None:
+        """
+        Stream order updates via WebSocket.
+        
+        Caches order status for real-time fill detection.
+        """
+        logger.debug("Starting order stream")
+        
+        try:
+            while True:
+                try:
+                    orders = await self._client.watch_orders()
+                    
+                    # Update order cache with latest status
+                    for order in orders:
+                        order_id = order.get("id")
+                        if order_id:
+                            self._order_updates[order_id] = {
+                                "status": order.get("status"),
+                                "filled": order.get("filled", 0.0),
+                                "remaining": order.get("remaining", 0.0),
+                                "average": order.get("average"),
+                            }
+                    
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Order stream error: {e}")
+                    await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+        
+        logger.debug("Order stream stopped")
+    
     async def _process_commands(self) -> None:
         """
         Process commands from the queue.
@@ -363,9 +410,9 @@ class ChaseOrderManager:
                 if self._needs_update(state, target_price):
                     await self._update_order(chase_id, target_price)
                 
-                # Check if filled
+                # Check if filled (uses WebSocket cache, instant)
                 if state.current_order_id:
-                    if await self._check_order_filled(chase_id):
+                    if self._check_order_filled(chase_id):
                         state.status = "filled"
                         logger.info(f"[{chase_id}] Filled at {state.fill_price}")
                         break
@@ -508,29 +555,41 @@ class ChaseOrderManager:
         except Exception as e:
             logger.error(f"[{chase_id}] Order failed: {e}")
     
-    async def _check_order_filled(self, chase_id: str) -> bool:
-        """Check if current order is filled."""
+    def _check_order_filled(self, chase_id: str) -> bool:
+        """
+        Check if current order is filled using WebSocket order cache.
+        
+        Uses real-time order updates instead of REST polling.
+        """
         state = self._active_chases[chase_id]
         
         if not state.current_order_id:
             return False
         
-        try:
-            orders = await self._client.fetch_open_orders(state.config.symbol)
-            
-            for order in orders:
-                if order.get("id") == state.current_order_id:
-                    state.fill_amount = order.get("filled", 0.0)
-                    return False
-            
-            # Not in open orders = filled
-            if state.retry_count > 0:
-                state.fill_price = state.current_price
-                state.fill_amount = state.config.amount
+        # Check WebSocket order cache
+        order_update = self._order_updates.get(state.current_order_id)
+        
+        if not order_update:
+            return False  # No update yet
+        
+        status = order_update.get("status", "")
+        filled = order_update.get("filled", 0.0)
+        
+        # Track partial fills
+        if filled > 0:
+            state.fill_amount = filled
+        
+        # Check for full fill
+        if status == "closed" or status == "filled":
+            state.fill_price = order_update.get("average") or state.current_price
+            state.fill_amount = order_update.get("filled", state.config.amount)
+            return True
+        
+        # Check if canceled (might have been partially filled)
+        if status == "canceled":
+            if filled > 0:
+                # Partial fill
+                state.fill_price = order_update.get("average") or state.current_price
                 return True
-            
-            return False
-            
-        except Exception as e:
-            logger.debug(f"[{chase_id}] Check fill error: {e}")
-            return False
+        
+        return False

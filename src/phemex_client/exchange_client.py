@@ -129,6 +129,7 @@ class PhemexClient:
         params = {
             "postOnly": True,
             "reduceOnly": reduce_only,
+            "timeInForce": "PostOnly",  # Ensure maker-only, reject if would cross
         }
         
         # Add position side for hedge mode
