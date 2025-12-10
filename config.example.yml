@@ -22,6 +22,5 @@ position_sizing:
 # Trading settings
 trading:
   symbols:
-    - "BTC/USDT:USDT"
     - "SOL/USDT:USDT"
   leverage: 20

@@ -203,6 +203,57 @@ class ChaseOrderManager:
         
         return chase_id
     
+    async def submit_chase_and_wait(
+        self,
+        config: ChaseOrderConfig,
+        timeout: float = 60.0,
+        poll_interval: float = 0.5,
+    ) -> ChaseOrderState:
+        """
+        Submit a chase order and wait for it to complete.
+        
+        Blocks until the chase reaches a terminal state (filled, stopped, 
+        canceled, error) or timeout is reached.
+        
+        Args:
+            config: Chase order configuration
+            timeout: Max seconds to wait (default 60s)
+            poll_interval: Seconds between status checks (default 0.5s)
+        
+        Returns:
+            Final ChaseOrderState with fill details
+        
+        Raises:
+            TimeoutError: If timeout reached before completion
+            RuntimeError: If chase manager not warmed up
+        """
+        chase_id = await self.submit_chase(config)
+        
+        elapsed = 0.0
+        while elapsed < timeout:
+            state = self._active_chases.get(chase_id)
+            
+            if state and state.status != "active":
+                # Terminal state reached
+                logger.info(
+                    f"[{chase_id}] Chase completed: {state.status}, "
+                    f"filled={state.total_filled:.4f}"
+                )
+                return state
+            
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+        
+        # Timeout - cancel and return current state
+        logger.warning(f"[{chase_id}] Timeout after {timeout}s, canceling...")
+        await self.cancel_chase(chase_id)
+        
+        state = self._active_chases.get(chase_id)
+        if state:
+            return state
+        
+        raise TimeoutError(f"Chase {chase_id} timed out after {timeout}s")
+    
     async def cancel_chase(self, chase_id: str) -> bool:
         """
         Cancel an active chase order.

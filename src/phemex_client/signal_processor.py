@@ -1,18 +1,18 @@
 # src/phemex_client/signal_processor.py
 # Signal processing logic for ENTRY, EXIT, and PARTIAL_EXIT actions
-# Core business logic for converting signals into orders
-# RELEVANT FILES: exchange_client.py, position_manager.py, models.py
+# Core business logic for converting signals into chase orders
+# RELEVANT FILES: exchange_client.py, position_manager.py, chase_order_manager.py
 
 """
 Signal processor for trading signals from ZMQ.
 
 Handles:
-- ENTRY: Open new positions with limit post-only orders
-- EXIT: Close entire positions with limit post-only orders
+- ENTRY: Open new positions with chase orders (follows bid/ask for fill)
+- EXIT: Close entire positions with chase orders
 - PARTIAL_EXIT: Close fraction of position, optionally move SL to break-even
 
-Uses limit post-only orders for all entries/exits to ensure maker fees.
-Uses market orders only for stop-loss protection.
+Uses chase orders for all entries/exits to ensure fills.
+Uses market orders only for stop-loss protection (safety net).
 """
 
 import asyncio
@@ -21,7 +21,8 @@ from typing import Optional
 
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.position_manager import PositionManager
-from phemex_client.models import PositionState, Direction
+from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.models import PositionState, Direction, ChaseOrderConfig
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class SignalProcessor:
         self,
         exchange_client: PhemexClient,
         position_manager: PositionManager,
+        chase_manager: ChaseOrderManager,
         deposit_size: float = 1000.0,
         r_percentage: float = 0.01,
         leverage: int = 20,
@@ -49,12 +51,14 @@ class SignalProcessor:
         Args:
             exchange_client: Phemex client for order placement
             position_manager: Position manager for state tracking
+            chase_manager: Chase order manager for limit order execution
             deposit_size: Total deposit in USDT
             r_percentage: Risk percentage per R unit (e.g. 0.01 = 1%)
             leverage: Default leverage multiplier
         """
         self.exchange = exchange_client
         self.positions = position_manager
+        self.chase_manager = chase_manager
         self.deposit_size = deposit_size
         self.r_percentage = r_percentage
         self.leverage = leverage
@@ -183,22 +187,48 @@ class SignalProcessor:
         side = "buy" if direction == "LONG" else "sell"
         
         try:
-            # Place entry order (limit post-only)
-            order = await self.exchange.place_limit_post_only(
+            # Place entry order using chase (follows bid/ask for fill)
+            # position_side is required for hedge mode accounts
+            position_side = "long" if direction == "LONG" else "short"
+            
+            chase_config = ChaseOrderConfig(
                 symbol=symbol,
                 side=side,
                 amount=contracts,
-                price=price,
+                # Default chase mode: bid2 for buys, ask2 for sells (one tick back)
+                max_chase_distance=0,  # No distance limit for entries
+                max_retries=100,       # Generous retry limit
+                reduce_only=False,
+                position_side=position_side,
             )
             
             logger.info(
-                f"Entry order placed: {order.order_id} "
-                f"{direction} {contracts} @ {price}"
+                f"Submitting chase entry: {direction} {contracts:.4f} {symbol}"
             )
             
-            # Place stop-loss (market conditional)
-            # Note: This SL is a safety net only. System sends EXIT signals for
-            # internal SL logic. Add 0.2% buffer to prevent premature triggers.
+            # Wait for chase to fill (up to 60s)
+            chase_state = await self.chase_manager.submit_chase_and_wait(
+                chase_config, timeout=60.0
+            )
+            
+            if chase_state.status != "filled":
+                logger.warning(
+                    f"Entry chase did not fill: {chase_state.status}, "
+                    f"filled={chase_state.total_filled:.4f}"
+                )
+                return
+            
+            # Entry filled - log the result
+            fill_price = chase_state.fill_price or price
+            filled_amount = chase_state.total_filled
+            
+            logger.info(
+                f"Entry filled: {direction} {filled_amount:.4f} @ {fill_price:.4f}"
+            )
+            
+            # Place stop-loss (market conditional) - SAFETY NET ONLY
+            # System sends EXIT signals for internal SL logic.
+            # Add 0.2% buffer to prevent premature triggers.
             if stop_loss:
                 sl_side = "sell" if direction == "LONG" else "buy"
                 
@@ -214,31 +244,20 @@ class SignalProcessor:
                 sl_order = await self.exchange.place_stop_loss_market(
                     symbol=symbol,
                     side=sl_side,
-                    amount=contracts,
+                    amount=filled_amount,  # Use actual filled amount
                     trigger_price=buffered_sl,
                 )
                 
                 logger.info(
                     f"Stop-loss placed: {sl_order.order_id} "
-                    f"trigger @ {stop_loss}"
+                    f"trigger @ {buffered_sl:.4f} (buffered from {stop_loss})"
                 )
             
-            # Place take-profit if provided
-            if take_profit:
-                tp_side = "sell" if direction == "LONG" else "buy"
-                
-                tp_order = await self.exchange.place_take_profit_limit(
-                    symbol=symbol,
-                    side=tp_side,
-                    amount=contracts,
-                    trigger_price=take_profit,
-                )
-                
-                logger.info(
-                    f"Take-profit placed: {tp_order.order_id} "
-                    f"trigger @ {take_profit}"
-                )
+            # Mark position as managed (not read-only) so we can close it later
+            self.positions.mark_as_managed(symbol)
             
+        except TimeoutError:
+            logger.error(f"Entry chase timed out for {symbol}")
         except Exception as e:
             logger.error(f"Entry order failed: {e}")
     
@@ -331,24 +350,48 @@ class SignalProcessor:
         side = "sell" if current_pos.side == "long" else "buy"
         
         try:
-            # Place partial close order (limit post-only, reduce-only)
-            order = await self.exchange.place_limit_post_only(
+            # Place partial close order using chase (follows bid/ask for fill)
+            # position_side: when closing a LONG, still 'long'; when closing SHORT, still 'short'
+            position_side = current_pos.side.lower()
+            
+            chase_config = ChaseOrderConfig(
                 symbol=symbol,
                 side=side,
                 amount=close_contracts,
-                price=price,
+                # Default chase mode: bid2 for buys, ask2 for sells
+                max_chase_distance=0,  # No distance limit for exits
+                max_retries=50,        # Lower limit for partial exits
                 reduce_only=True,
+                position_side=position_side,
             )
             
             logger.info(
-                f"Partial exit order: {order.order_id} "
-                f"{close_contracts} of {current_pos.contracts} @ {price}"
+                f"Submitting chase partial exit: {close_contracts:.4f} of "
+                f"{current_pos.contracts:.4f} {symbol}"
             )
+            
+            # Wait for chase to fill (up to 30s for partial exits)
+            chase_state = await self.chase_manager.submit_chase_and_wait(
+                chase_config, timeout=30.0
+            )
+            
+            if chase_state.status != "filled":
+                logger.warning(
+                    f"Partial exit chase did not fill: {chase_state.status}, "
+                    f"filled={chase_state.total_filled:.4f}"
+                )
+            else:
+                logger.info(
+                    f"Partial exit filled: {chase_state.total_filled:.4f} "
+                    f"@ {chase_state.fill_price:.4f}"
+                )
             
             # Move SL to break-even if requested
             if move_sl_to_be:
                 await self._move_sl_to_breakeven(symbol, current_pos)
             
+        except TimeoutError:
+            logger.error(f"Partial exit chase timed out for {symbol}")
         except Exception as e:
             logger.error(f"Partial exit failed: {e}")
     
@@ -358,13 +401,14 @@ class SignalProcessor:
         price: float,
     ) -> None:
         """
-        Close entire position with limit post-only order.
+        Close entire position with chase order.
         
         Cancels existing orders first (including SL/TP).
+        Uses chase order to ensure fill.
         
         Args:
             position: Position to close
-            price: Limit price for close order
+            price: Target price (used for logging, chase follows market)
         """
         # Cancel existing orders first (including SL/TP)
         await self.exchange.cancel_all_orders(position.symbol)
@@ -372,24 +416,47 @@ class SignalProcessor:
         # Determine close side
         side = "sell" if position.side == "long" else "buy"
         
+        # position_side: when closing a LONG, still 'long'; when closing SHORT, still 'short'
+        position_side = position.side.lower()
+        
         try:
-            order = await self.exchange.place_limit_post_only(
+            chase_config = ChaseOrderConfig(
                 symbol=position.symbol,
                 side=side,
                 amount=position.contracts,
-                price=price,
+                # Default chase mode: bid2 for buys, ask2 for sells
+                max_chase_distance=0,  # No distance limit for closes
+                max_retries=100,       # Generous retry limit for close
                 reduce_only=True,
+                position_side=position_side,
             )
             
             logger.info(
-                f"Close order: {order.order_id} "
-                f"{position.symbol} {position.contracts} @ {price}"
+                f"Submitting chase close: {position.contracts:.4f} {position.symbol}"
             )
+            
+            # Wait for chase to fill (up to 60s for closes)
+            chase_state = await self.chase_manager.submit_chase_and_wait(
+                chase_config, timeout=60.0
+            )
+            
+            if chase_state.status != "filled":
+                logger.warning(
+                    f"Close chase did not fill: {chase_state.status}, "
+                    f"filled={chase_state.total_filled:.4f}"
+                )
+            else:
+                logger.info(
+                    f"Position closed: {chase_state.total_filled:.4f} "
+                    f"@ {chase_state.fill_price:.4f}"
+                )
             
             # Immediately update local state
             # WebSocket will confirm, but this prevents duplicate signals
             self.positions.clear_position(position.symbol)
             
+        except TimeoutError:
+            logger.error(f"Close chase timed out for {position.symbol}")
         except Exception as e:
             logger.error(f"Close position failed: {e}")
     

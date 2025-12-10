@@ -7,8 +7,8 @@
 Phemex ZMQ Order Listener - Main Entry Point
 
 Listens for trading signals via ZMQ and executes on Phemex Futures.
-Uses limit post-only orders for entries/exits.
-Uses market orders for stop-loss only.
+Uses chase orders for entries/exits (follows bid/ask for guaranteed fills).
+Uses market orders for stop-loss only (safety net).
 
 Usage:
     poetry run python examples/run_listener.py
@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.position_manager import PositionManager
+from phemex_client.chase_order_manager import ChaseOrderManager
 from phemex_client.signal_processor import SignalProcessor
 from phemex_client.zmq_listener import ZmqListener
 
@@ -101,6 +102,13 @@ async def main() -> None:
         )
         logger.info("Exchange initialized")
         
+        # Enforce single symbol limit
+        if len(config.trading.symbols) > 1:
+            logger.error("App supports strictly ONE symbol at a time.")
+            logger.error(f"Found {len(config.trading.symbols)}: {config.trading.symbols}")
+            await exchange.close()
+            sys.exit(1)
+        
     except Exception as e:
         logger.error(f"Failed to initialize exchange: {e}")
         await exchange.close()
@@ -118,10 +126,23 @@ async def main() -> None:
         await exchange.close()
         sys.exit(1)
     
-    # Initialize signal processor
+    # Initialize chase order manager (singleton)
+    chase_manager = ChaseOrderManager.get_instance(exchange)
+    
+    try:
+        await chase_manager.warmup(config.trading.symbols)
+        logger.info("Chase order manager warmed up")
+        
+    except Exception as e:
+        logger.error(f"Failed to warmup chase manager: {e}")
+        await exchange.close()
+        sys.exit(1)
+    
+    # Initialize signal processor (uses chase orders for entries/exits)
     signal_processor = SignalProcessor(
         exchange_client=exchange,
         position_manager=position_manager,
+        chase_manager=chase_manager,
         deposit_size=config.position_sizing.deposit_size,
         r_percentage=config.position_sizing.r_percentage,
         leverage=config.trading.leverage,
@@ -165,6 +186,8 @@ async def main() -> None:
         
         position_manager.stop()
         zmq_listener.stop()
+        await chase_manager.shutdown()
+        ChaseOrderManager.reset_instance()
         
         # Cancel all tasks
         for task in tasks:
