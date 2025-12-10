@@ -16,6 +16,7 @@ Provides:
 
 import asyncio
 import logging
+import math
 from typing import Any, Optional
 
 import ccxt.pro as ccxt
@@ -24,6 +25,23 @@ from phemex_client.models import OrderResult
 
 
 logger = logging.getLogger(__name__)
+
+
+def truncate_to_step_size(amount: float, step_size: float = 0.01) -> float:
+    """
+    Truncate amount to the nearest step size (floor).
+    
+    Phemex requires order sizes to be multiples of the minimum step.
+    For SOLUSDT, step size is 0.01.
+    
+    Args:
+        amount: Order amount
+        step_size: Minimum step size (default 0.01)
+    
+    Returns:
+        Amount truncated to step size
+    """
+    return math.floor(amount / step_size) * step_size
 
 
 class PhemexClient:
@@ -143,11 +161,14 @@ class PhemexClient:
         if position_side:
             params["posSide"] = position_side.capitalize()  # 'Long' or 'Short'
         
+        # Truncate amount to minimum step size (0.01 for SOL)
+        truncated_amount = truncate_to_step_size(amount)
+        
         order = await self._create_order_with_retry(
             symbol=symbol,
             order_type="limit",
             side=side,
-            amount=amount,
+            amount=truncated_amount,
             price=price,
             params=params,
         )
@@ -184,11 +205,14 @@ class PhemexClient:
             "reduceOnly": True,
         }
         
+        # Truncate amount to minimum step size
+        truncated_amount = truncate_to_step_size(amount)
+        
         order = await self._create_order_with_retry(
             symbol=symbol,
             order_type="market",
             side=side,
-            amount=amount,
+            amount=truncated_amount,
             price=None,
             params=params,
         )
@@ -225,11 +249,14 @@ class PhemexClient:
             "reduceOnly": True,
         }
         
+        # Truncate amount to minimum step size
+        truncated_amount = truncate_to_step_size(amount)
+        
         order = await self._create_order_with_retry(
             symbol=symbol,
             order_type="limit",
             side=side,
-            amount=amount,
+            amount=truncated_amount,
             price=limit_price,
             params=params,
         )
@@ -284,12 +311,15 @@ class PhemexClient:
             if position_side:
                 params["posSide"] = position_side.capitalize()
             
+            # Truncate amount to minimum step size if provided
+            truncated_amount = truncate_to_step_size(amount) if amount else None
+            
             order = await self.exchange.edit_order(
                 id=order_id,
                 symbol=symbol,
                 type="limit",
                 side=side,
-                amount=amount,
+                amount=truncated_amount,
                 price=price,
                 params=params,
             )
