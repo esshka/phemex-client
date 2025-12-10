@@ -1,0 +1,35 @@
+[project]
+name = "phemex-client"
+version = "0.1.0"
+description = "Phemex ZMQ Order Listener - Trading signals via ZeroMQ"
+authors = [
+    {name = "eugeny",email = "esshka@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ccxt>=4.4.0",
+    "pyzmq>=25.0",
+    "pyyaml>=6.0",
+]
+
+[tool.poetry]
+packages = [{include = "phemex_client", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+ccxt = "^4.4.0"
+pyzmq = "^25.0"
+pyyaml = "^6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-asyncio = "^0.23"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

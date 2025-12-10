@@ -1,0 +1,27 @@
+# config.example.yml
+# Phemex ZMQ Order Listener - Configuration
+# Copy this file to config.yml and fill in your values
+
+# Phemex API credentials
+phemex:
+  api_key: "your_api_key_here"
+  secret: "your_api_secret_here"
+  testnet: false
+
+# ZeroMQ settings
+zmq:
+  host: "127.0.0.1"
+  port: 5555
+  topic: "orders"
+
+# Position sizing
+position_sizing:
+  deposit_size: 1000.0    # Total deposit in USDT
+  r_percentage: 0.01      # Risk per R unit (1% = 0.01)
+
+# Trading settings
+trading:
+  symbols:
+    - "BTC/USDT:USDT"
+    - "SOL/USDT:USDT"
+  leverage: 20
