@@ -90,8 +90,15 @@ class PhemexClient:
                 logger.debug(f"Margin mode info for {symbol}: {e}")
             
             try:
-                # Set leverage
-                await self.exchange.set_leverage(leverage, symbol)
+                # Set leverage for both position sides (required for Hedge mode)
+                # In Hedge mode, Phemex requires setting leverage per side
+                for pos_side in ["Long", "Short"]:
+                    try:
+                        await self.exchange.set_leverage(
+                            leverage, symbol, params={"posSide": pos_side}
+                        )
+                    except Exception:
+                        pass  # May fail if already set
                 logger.info(f"Set leverage {leverage}x for {symbol}")
             except Exception as e:
                 logger.warning(f"Leverage setting for {symbol}: {e}")

@@ -197,14 +197,25 @@ class SignalProcessor:
             )
             
             # Place stop-loss (market conditional)
+            # Note: This SL is a safety net only. System sends EXIT signals for
+            # internal SL logic. Add 0.2% buffer to prevent premature triggers.
             if stop_loss:
                 sl_side = "sell" if direction == "LONG" else "buy"
+                
+                # Apply 0.2% buffer: move SL slightly further from entry
+                # LONG: SL is below entry, so subtract 0.2%
+                # SHORT: SL is above entry, so add 0.2%
+                sl_buffer = 0.002  # 0.2%
+                if direction == "LONG":
+                    buffered_sl = stop_loss * (1 - sl_buffer)
+                else:
+                    buffered_sl = stop_loss * (1 + sl_buffer)
                 
                 sl_order = await self.exchange.place_stop_loss_market(
                     symbol=symbol,
                     side=sl_side,
                     amount=contracts,
-                    trigger_price=stop_loss,
+                    trigger_price=buffered_sl,
                 )
                 
                 logger.info(
