@@ -40,15 +40,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
 async def run_chase_order() -> None:
     """
     Run a chase limit order example.
     
     Uses singleton pattern with warmup for low-latency execution.
     """
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Run chase limit order example")
+    parser.add_argument(
+        "--side", 
+        type=str, 
+        choices=["long", "short"], 
+        default="long",
+        help="Position side to open/manage (long or short)"
+    )
+    args = parser.parse_args()
+
     # Configuration
     SYMBOL = "SOL/USDT:USDT"
     ORDER_SIZE_USDT = 5.0  # Minimum notional on Phemex
+    
+    # Determine sides based on argument
+    position_side = args.side.lower()  # 'long' or 'short'
+    # For opening new positions:
+    # Long = Buy
+    # Short = Sell
+    order_side = "buy" if position_side == "long" else "sell"
     
     logger.info("=" * 70)
     logger.info("CHASE LIMIT ORDER EXAMPLE (Singleton Pattern)")
@@ -101,22 +122,21 @@ async def run_chase_order() -> None:
         
         # Create chase order config
         # NOTE: position_side is required for accounts in hedge mode
-        # Set to 'long' for buy orders opening/managing a long position
-        # Set to 'short' for sell orders opening/managing a short position
         chase_config = ChaseOrderConfig(
             symbol=SYMBOL,
-            side="buy",
+            side=order_side,
             amount=order_amount,
             # chase_mode defaults to bid2 for buys (one tick back from top)
             max_chase_distance=2.0,    # Stop if price moves $2 from start
             max_retries=50,            # Max 50 order updates
             reduce_only=False,
-            position_side="long",      # Required for hedge mode accounts
+            position_side=position_side,      # Required for hedge mode accounts
         )
         
         logger.info(f"\nChase Order Config:")
         logger.info(f"  Symbol: {chase_config.symbol}")
         logger.info(f"  Side: {chase_config.side.upper()}")
+        logger.info(f"  Position Side: {chase_config.position_side.upper()}")
         logger.info(f"  Amount: {chase_config.amount:.4f} SOL (~${ORDER_SIZE_USDT})")
         logger.info(f"  Mode: {chase_config.chase_mode or 'default (bid2/ask2)'}")
         logger.info(f"  Max Chase Distance: ${chase_config.max_chase_distance}")

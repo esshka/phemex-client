@@ -43,10 +43,26 @@ async def close_position_with_chase() -> None:
     """
     Scan for active position and close it using chase order.
     """
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Close active position with chase order")
+    parser.add_argument(
+        "--side", 
+        type=str, 
+        choices=["long", "short"], 
+        default="long",
+        help="Position side to close (long or short)"
+    )
+    args = parser.parse_args()
+    
+    target_side = args.side.lower()
+    
     SYMBOL = "SOL/USDT:USDT"
     
     logger.info("=" * 70)
     logger.info("CLOSE POSITION WITH CHASE ORDER")
+    logger.info(f"Target Side: {target_side.upper()}")
     logger.info("=" * 70)
     
     # Load config
@@ -77,13 +93,16 @@ async def close_position_with_chase() -> None:
         position = None
         for pos in positions:
             if pos.get("symbol") == SYMBOL:
+                pos_side = pos.get("side", "").lower()
                 contracts = float(pos.get("contracts", 0))
-                if abs(contracts) > 0:
+                
+                # Only select if it matches our target side and has size
+                if abs(contracts) > 0 and pos_side == target_side:
                     position = pos
                     break
         
         if not position:
-            logger.info("✓ No active position found. Nothing to close.")
+            logger.info(f"✓ No active {target_side.upper()} position found. Nothing to close.")
             return
         
         # Extract position details
