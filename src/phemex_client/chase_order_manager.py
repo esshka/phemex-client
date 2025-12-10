@@ -340,9 +340,18 @@ class ChaseOrderManager:
                 # This prevents placing new orders when previous one was filled
                 if state.current_order_id:
                     if await self._check_order_filled(chase_id):
-                        state.status = "filled"
-                        logger.info(f"[{chase_id}] Filled at {state.fill_price}")
-                        break
+                        # Current order is filled, but is the chase complete?
+                        if state.is_fully_filled:
+                            state.status = "filled"
+                            logger.info(f"[{chase_id}] Filled at {state.fill_price}")
+                            break
+                        else:
+                            # Order filled but chase not complete, place new order
+                            state.current_order_id = None
+                            logger.info(
+                                f"[{chase_id}] Order filled, continuing for "
+                                f"remaining {state.remaining_amount:.4f}"
+                            )
                 
                 # Also check if fully filled from accumulated partial fills
                 if state.is_fully_filled:
