@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.models import ChaseOrderConfig
 
 
@@ -73,15 +74,21 @@ async def run_chase_order() -> None:
             leverage=config.trading.leverage,
         )
         
-        # Get singleton chase manager
-        chase_manager = ChaseOrderManager.get_instance(client)
+        # Get singleton websocket manager
+        ws_manager = WebsocketManager.get_instance(client)
         
-        # Warmup: establish WS connections and start price streaming
-        logger.info("\nWarming up ChaseOrderManager...")
-        await chase_manager.warmup([SYMBOL])
+        # Start WS streaming
+        logger.info("\nStarting WebsocketManager...")
+        await ws_manager.start([SYMBOL])
+        
+        # Get singleton chase manager
+        chase_manager = ChaseOrderManager.get_instance(client, ws_manager)
+        
+        # Start chase manager
+        await chase_manager.start()
         
         # Get current cached prices
-        prices = chase_manager.get_prices(SYMBOL)
+        prices = ws_manager.get_prices(SYMBOL)
         if prices:
             logger.info(f"\nCached Prices (real-time from WS):")
             logger.info(f"  Bid1: ${prices['bid1']:.4f}")
@@ -131,7 +138,7 @@ async def run_chase_order() -> None:
                 break
             
             # Log current prices
-            prices = chase_manager.get_prices(SYMBOL)
+            prices = ws_manager.get_prices(SYMBOL)
             if prices:
                 logger.info(
                     f"Status: {status['status']} | "
@@ -159,9 +166,12 @@ async def run_chase_order() -> None:
     finally:
         if chase_manager:
             await chase_manager.shutdown()
+        if 'ws_manager' in locals() and ws_manager:
+            await ws_manager.stop()
         await client.close()
         # Reset singleton for next run
         ChaseOrderManager.reset_instance()
+        WebsocketManager.reset_instance()
         logger.info("\nDone!")
 
 

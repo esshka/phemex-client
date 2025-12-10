@@ -28,6 +28,7 @@ from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.position_manager import PositionManager
 from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.signal_processor import SignalProcessor
 from phemex_client.zmq_listener import ZmqListener
 
@@ -126,15 +127,29 @@ async def main() -> None:
         await exchange.close()
         sys.exit(1)
     
-    # Initialize chase order manager (singleton)
-    chase_manager = ChaseOrderManager.get_instance(exchange)
+    # Initialize Websocket Manager (Singleton)
+    ws_manager = WebsocketManager.get_instance(exchange)
     
     try:
-        await chase_manager.warmup(config.trading.symbols)
-        logger.info("Chase order manager warmed up")
+        await ws_manager.start(config.trading.symbols)
+        logger.info("Websocket manager started")
         
     except Exception as e:
-        logger.error(f"Failed to warmup chase manager: {e}")
+        logger.error(f"Failed to start websocket manager: {e}")
+        await exchange.close()
+        sys.exit(1)
+    
+    # Initialize chase order manager (singleton)
+    # Requires ws_manager for dependency injection
+    chase_manager = ChaseOrderManager.get_instance(exchange, ws_manager)
+    
+    try:
+        # Start chase manager (command processor)
+        await chase_manager.start()
+        logger.info("Chase order manager started")
+        
+    except Exception as e:
+        logger.error(f"Failed to start chase manager: {e}")
         await exchange.close()
         sys.exit(1)
     
@@ -187,7 +202,9 @@ async def main() -> None:
         position_manager.stop()
         zmq_listener.stop()
         await chase_manager.shutdown()
+        await ws_manager.stop()
         ChaseOrderManager.reset_instance()
+        WebsocketManager.reset_instance()
         
         # Cancel all tasks
         for task in tasks:

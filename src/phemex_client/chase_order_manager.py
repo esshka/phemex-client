@@ -1,19 +1,21 @@
 # src/phemex_client/chase_order_manager.py
 # Singleton manager for chase limit orders with real-time bid1/ask1 streaming
 # Establishes WS connection on warmup, receives commands via async queue
-# RELEVANT FILES: exchange_client.py, models.py, config.py
+# RELEVANT FILES: exchange_client.py, models.py, config.py, websocket_manager.py
 
 """
 Chase Order Manager for Phemex.
 
 Singleton service that:
-1. Streams bid1/ask1 prices via WebSocket (warmup phase)
-2. Receives chase commands via async queue (minimal latency)
+1. Receives chase commands via async queue (minimal latency)
+2. Uses WebsocketManager for prices and order updates
 3. Updates orders when price changes
 
 Usage:
-    manager = ChaseOrderManager.get_instance(client)
-    await manager.warmup(["SOL/USDT:USDT"])
+    ws_manager = WebsocketManager.get_instance(client)
+    manager = ChaseOrderManager.get_instance(client, ws_manager)
+    await ws_manager.start(["SOL/USDT:USDT"])
+    await manager.start()
     chase_id = await manager.submit_chase(config)
 """
 
@@ -23,7 +25,8 @@ import time
 import uuid
 from typing import Optional
 
-from phemex_client.exchange_client import PhemexClient
+from phemex_client.exchange_client import PhemexClient, truncate_to_step_size
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.models import ChaseOrderConfig, ChaseOrderState, OrderResult
 
 
@@ -34,8 +37,8 @@ class ChaseOrderManager:
     """
     Singleton manager for chase limit orders.
     
-    Streams bid1/ask1 in background and processes chase commands
-    via async queue for minimal latency.
+    Processes chase commands via async queue.
+    Relies on WebsocketManager for real-time data.
     """
     
     # Singleton instance
@@ -48,18 +51,21 @@ class ChaseOrderManager:
     MIN_AMEND_INTERVAL = 1.0
     
     @classmethod
-    def get_instance(cls, exchange_client: PhemexClient) -> "ChaseOrderManager":
+    def get_instance(cls, exchange_client: PhemexClient, ws_manager: Optional[WebsocketManager] = None) -> "ChaseOrderManager":
         """
         Get or create singleton instance.
         
         Args:
             exchange_client: Initialized PhemexClient
+            ws_manager: Initialized WebsocketManager (required for first init)
         
         Returns:
             ChaseOrderManager singleton
         """
         if cls._instance is None:
-            cls._instance = cls(exchange_client)
+            if ws_manager is None:
+                raise ValueError("ws_manager required for initialization")
+            cls._instance = cls(exchange_client, ws_manager)
         return cls._instance
     
     @classmethod
@@ -67,27 +73,19 @@ class ChaseOrderManager:
         """Reset singleton (for testing)."""
         cls._instance = None
     
-    def __init__(self, exchange_client: PhemexClient):
+    def __init__(self, exchange_client: PhemexClient, ws_manager: WebsocketManager):
         """
         Initialize chase order manager.
         
         Use get_instance() instead of direct construction.
         """
         self._client = exchange_client
-        
-        # Price cache: symbol -> {bid1, bid2, ask1, ask2}
-        self._prices: dict[str, dict] = {}
-        
-        # Order updates cache: order_id -> order_info
-        # Populated by WebSocket order stream for real-time fill detection
-        self._order_updates: dict[str, dict] = {}
+        self._ws_manager = ws_manager
         
         # Active chase orders
         self._active_chases: dict[str, ChaseOrderState] = {}
         
         # Background tasks
-        self._orderbook_tasks: dict[str, asyncio.Task] = {}
-        self._order_stream_tasks: dict[str, asyncio.Task] = {}  # Per-symbol order streams
         self._chase_tasks: dict[str, asyncio.Task] = {}
         
         # Command queue for submitting chase orders
@@ -95,61 +93,27 @@ class ChaseOrderManager:
         self._command_processor_task: Optional[asyncio.Task] = None
         
         # State
-        self._warmed_up = False
         self._running = False
-        self._symbols: list[str] = []  # Symbols we're tracking
     
-    @property
-    def is_warmed_up(self) -> bool:
-        """Check if manager is warmed up and ready."""
-        return self._warmed_up
-    
-    async def warmup(self, symbols: list[str]) -> None:
+    async def start(self) -> None:
         """
-        Warmup phase: establish WS connections and start price streaming.
+        Start the chase manager (command processor).
         
-        Must be called before submitting chase orders.
-        
-        Args:
-            symbols: List of symbols to stream prices for
+        Note: WebsocketManager must be started separately.
         """
-        if self._warmed_up:
-            logger.warning("Already warmed up, skipping")
+        if self._running:
             return
-        
-        logger.info(f"Warming up ChaseOrderManager for {len(symbols)} symbols...")
-        
-        # Start orderbook streaming for each symbol
-        for symbol in symbols:
-            task = asyncio.create_task(self._stream_orderbook(symbol))
-            self._orderbook_tasks[symbol] = task
-        
-        # Store symbols for order streaming
-        self._symbols = symbols
-        
-        # Start order updates stream for each symbol (for fill detection)
-        # Phemex requires symbol for WebSocket order subscriptions
-        for symbol in symbols:
-            task = asyncio.create_task(self._stream_orders(symbol))
-            self._order_stream_tasks[symbol] = task
-        
-        # Wait for initial prices
-        for symbol in symbols:
-            for _ in range(50):  # 5 second timeout
-                if symbol in self._prices:
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                logger.warning(f"Timeout waiting for {symbol} prices")
-        
-        # Start command processor
+            
         self._running = True
         self._command_processor_task = asyncio.create_task(
             self._process_commands()
         )
-        
-        self._warmed_up = True
-        logger.info(f"ChaseOrderManager warmed up. Streaming: {list(self._prices.keys())}")
+        logger.info("ChaseOrderManager started")
+    
+    # Backward compatibility alias
+    async def warmup(self, symbols: list[str]) -> None:
+        """Alias for start() - symbols are handled by WebsocketManager."""
+        await self.start()
     
     async def shutdown(self) -> None:
         """Shutdown manager and cancel all tasks."""
@@ -161,22 +125,11 @@ class ChaseOrderManager:
         for chase_id in list(self._active_chases.keys()):
             await self.cancel_chase(chase_id)
         
-        # Cancel orderbook streams
-        for task in self._orderbook_tasks.values():
-            task.cancel()
-        self._orderbook_tasks.clear()
-        
-        # Cancel order streams
-        for task in self._order_stream_tasks.values():
-            task.cancel()
-        self._order_stream_tasks.clear()
-        
         # Cancel command processor
         if self._command_processor_task:
             self._command_processor_task.cancel()
             self._command_processor_task = None
         
-        self._warmed_up = False
         logger.info("ChaseOrderManager shutdown complete")
     
     async def submit_chase(self, config: ChaseOrderConfig) -> str:
@@ -191,8 +144,9 @@ class ChaseOrderManager:
         Returns:
             chase_id: Unique ID to track this chase
         """
-        if not self._warmed_up:
-            raise RuntimeError("ChaseOrderManager not warmed up. Call warmup() first.")
+        if not self._running:
+             # Auto-start if not running
+             await self.start()
         
         chase_id = str(uuid.uuid4())[:8]
         
@@ -225,7 +179,6 @@ class ChaseOrderManager:
         
         Raises:
             TimeoutError: If timeout reached before completion
-            RuntimeError: If chase manager not warmed up
         """
         chase_id = await self.submit_chase(config)
         
@@ -312,15 +265,6 @@ class ChaseOrderManager:
             "remaining_amount": state.remaining_amount,
         }
     
-    def get_prices(self, symbol: str) -> Optional[dict]:
-        """
-        Get cached bid1/ask1 prices for a symbol.
-        
-        Returns:
-            {"bid1": float, "ask1": float} or None
-        """
-        return self._prices.get(symbol)
-    
     def get_all_active_chases(self) -> list[dict]:
         """Get status of all active chase orders."""
         return [
@@ -328,86 +272,7 @@ class ChaseOrderManager:
             for cid in self._active_chases
             if self._active_chases[cid].status == "active"
         ]
-    
-    # -------------------------------------------------------------------------
-    # Background Tasks
-    # -------------------------------------------------------------------------
-    
-    async def _stream_orderbook(self, symbol: str) -> None:
-        """
-        Stream orderbook updates and cache bid1/ask1.
-        
-        Runs continuously in background until shutdown.
-        """
-        logger.debug(f"Starting orderbook stream for {symbol}")
-        
-        try:
-            while True:
-                try:
-                    orderbook = await self._client.watch_order_book(symbol)
-                    
-                    if orderbook["bids"] and orderbook["asks"]:
-                        self._prices[symbol] = {
-                            "bid1": orderbook["bids"][0][0],
-                            "bid2": orderbook["bids"][1][0] if len(orderbook["bids"]) > 1 else orderbook["bids"][0][0],
-                            "ask1": orderbook["asks"][0][0],
-                            "ask2": orderbook["asks"][1][0] if len(orderbook["asks"]) > 1 else orderbook["asks"][0][0],
-                        }
-                    
-                except asyncio.CancelledError:
-                    raise  # Re-raise to exit
-                except Exception as e:
-                    logger.warning(f"Orderbook stream error for {symbol}: {e}")
-                    await asyncio.sleep(1.0)
-        except asyncio.CancelledError:
-            pass
-        
-        logger.debug(f"Orderbook stream stopped for {symbol}")
-    
-    async def _stream_orders(self, symbol: str) -> None:
-        """
-        Stream order updates via WebSocket for a specific symbol.
-        
-        Caches order status for real-time fill detection.
-        Phemex requires symbol to be specified for order subscriptions.
-        """
-        logger.info(f"Starting order stream for {symbol}")
-        
-        try:
-            while True:
-                try:
-                    orders = await self._client.watch_orders(symbol)
-                    
-                    # Update order cache with latest status
-                    for order in orders:
-                        order_id = order.get("id")
-                        if order_id:
-                            status = order.get("status")
-                            filled = order.get("filled", 0.0)
-                            
-                            self._order_updates[order_id] = {
-                                "status": status,
-                                "filled": filled,
-                                "remaining": order.get("remaining", 0.0),
-                                "average": order.get("average"),
-                            }
-                            
-                            # Log ALL order updates (not just fills) for debugging
-                            logger.info(
-                                f"WS order: {order_id[:8]}... "
-                                f"status={status} filled={filled}"
-                            )
-                    
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"Order stream error for {symbol}: {e}")
-                    await asyncio.sleep(1.0)
-        except asyncio.CancelledError:
-            pass
-        
-        logger.info(f"Order stream stopped for {symbol}")
-    
+
     async def _process_commands(self) -> None:
         """
         Process commands from the queue.
@@ -439,6 +304,12 @@ class ChaseOrderManager:
     
     async def _start_chase(self, chase_id: str, config: ChaseOrderConfig) -> None:
         """Start a new chase order."""
+        # Sanitize amount to be a multiple of step size (0.01)
+        safe_amount = truncate_to_step_size(config.amount)
+        if safe_amount != config.amount:
+            logger.info(f"[{chase_id}] Truncating amount {config.amount} -> {safe_amount}")
+            config.amount = safe_amount
+
         # Create state
         state = ChaseOrderState(
             chase_id=chase_id,
@@ -479,10 +350,11 @@ class ChaseOrderManager:
                     logger.info(f"[{chase_id}] Fully filled (accumulated): {state.total_filled:.4f}")
                     break
                 
-                # Get cached prices (instant, no WS wait)
-                prices = self._prices.get(config.symbol)
+                # Get cached prices from WebsocketManager
+                prices = self._ws_manager.get_prices(config.symbol)
                 
                 if not prices:
+                    # Retry getting prices a few times before sleeping
                     await asyncio.sleep(0.05)
                     continue
                 
@@ -585,17 +457,6 @@ class ChaseOrderManager:
     ) -> float:
         """
         Calculate target order price based on chase mode.
-        
-        Supported modes:
-        - 'bid1': Best bid price
-        - 'bid2': Second best bid price (default for buys)
-        - 'ask1': Best ask price
-        - 'ask2': Second best ask price (default for sells)
-        - 'distance': Fixed offset from bid1/ask1
-        
-        Includes spread protection:
-        - BUY orders will never be placed at or above ask1
-        - SELL orders will never be placed at or below bid1
         """
         bid1 = prices["bid1"]
         bid2 = prices["bid2"]
@@ -621,12 +482,9 @@ class ChaseOrderManager:
             price = bid2 if config.side == "buy" else ask2
         
         # Spread protection: ensure we never cross the spread
-        # This prevents accidental taker orders
         if config.side == "buy":
-            # Buy orders must be below ask1 (use bid1 as max)
             price = min(price, bid1)
         else:
-            # Sell orders must be above bid1 (use ask1 as min)
             price = max(price, ask1)
         
         return price
@@ -634,17 +492,13 @@ class ChaseOrderManager:
     async def _update_order(self, chase_id: str, target_price: float) -> None:
         """
         Place or update the chase order.
-        
-        Uses edit_order (amend) when an order exists to reduce latency.
-        Falls back to cancel+place if amend fails.
-        Aggregates partial fills from previous orders.
         """
         state = self._active_chases[chase_id]
         config = state.config
         
-        # Check for partial fills from WebSocket cache
+        # Check for partial fills from WebSocket cache via WebsocketManager
         if state.current_order_id:
-            order_update = self._order_updates.get(state.current_order_id)
+            order_update = self._ws_manager.get_order_update(state.current_order_id)
             if order_update:
                 current_filled = order_update.get("filled", 0.0)
                 if current_filled > state.fill_amount:
@@ -668,7 +522,7 @@ class ChaseOrderManager:
             state.status = "filled"
             return
         
-        # If order exists, try to AMEND it (single API call, lower latency)
+        # If order exists, try to AMEND it
         if state.current_order_id:
             try:
                 result = await self._client.edit_order(
@@ -694,12 +548,11 @@ class ChaseOrderManager:
                 error_str = str(e)
                 
                 # ORDER_NOT_FOUND = order was already filled, canceled, or rejected
-                # Check WebSocket cache FIRST, then REST API as fallback
                 if "ORDER_NOT_FOUND" in error_str or "10002" in error_str:
                     order_id_to_check = state.current_order_id
                     
                     # Step 1: Check WebSocket cache
-                    order_update = self._order_updates.get(order_id_to_check)
+                    order_update = self._ws_manager.get_order_update(order_id_to_check)
                     ws_filled = order_update.get("filled", 0.0) if order_update else 0.0
                     ws_status = order_update.get("status", "") if order_update else ""
                     
@@ -713,69 +566,47 @@ class ChaseOrderManager:
                         if rest_order:
                             ws_filled = float(rest_order.get("filled", 0.0))
                             ws_status = rest_order.get("status", "")
-                            # Update cache with REST data
-                            self._order_updates[order_id_to_check] = {
-                                "status": ws_status,
-                                "filled": ws_filled,
-                                "remaining": rest_order.get("remaining", 0.0),
-                                "average": rest_order.get("average"),
-                            }
-                            logger.info(
-                                f"[{chase_id}] REST API: status={ws_status}, filled={ws_filled}"
-                            )
                     
                     # Step 3: Process fill info
                     if ws_filled > state.fill_amount:
-                        # Confirmed fill
                         additional = ws_filled - state.fill_amount
                         state.total_filled += additional
                         state.fill_amount = ws_filled
-                        avg_price = (
-                            order_update.get("average") if order_update 
-                            else state.current_price
-                        )
-                        state.fill_price = avg_price or state.current_price
+                        state.fill_price = state.current_price
+                        
                         logger.info(
                             f"[{chase_id}] Fill confirmed: "
                             f"+{additional:.4f}, Total: {state.total_filled:.4f}"
                         )
-                        # Check if fully filled and return immediately
                         if state.is_fully_filled:
                             state.status = "filled"
-                            logger.info(f"[{chase_id}] Fully filled! Stopping chase.")
                             return
                     elif ws_status in ("closed", "filled"):
-                        # Order is closed but we didn't detect any new fill
-                        # This means order was fully filled before we checked
                         logger.info(
-                            f"[{chase_id}] Order {order_id_to_check[:8]}... "
-                            f"is {ws_status}, assuming filled"
+                            f"[{chase_id}] Order is {ws_status}, assuming filled"
                         )
                         state.total_filled = config.amount
                         state.status = "filled"
                         return
                     else:
-                        # No fill detected - order was canceled/rejected
                         logger.warning(
-                            f"[{chase_id}] Order {order_id_to_check[:8]}... "
-                            f"not found, status={ws_status}, filled={ws_filled}"
+                            f"[{chase_id}] Order not found/failed, status={ws_status}"
                         )
                     
-                    # Clear order ID, will place new order below
+                    # Clear order ID
                     state.current_order_id = None
                 
-                # Minimum amount precision error = remaining too small, consider filled
+                # Minimum amount precision error
                 elif "minimum amount precision" in error_str.lower():
                     logger.info(
-                        f"[{chase_id}] Remaining {remaining:.4f} below minimum precision, "
-                        f"considering filled (total: {state.total_filled:.4f})"
+                        f"[{chase_id}] Remaining {remaining:.4f} below min precision, "
+                        f"considering filled"
                     )
                     state.status = "filled"
                     state.fill_price = state.current_price
                     return
                 
                 else:
-                    # Other amend errors - try cancel+place
                     logger.warning(f"[{chase_id}] Amend failed, will cancel+place: {e}")
                     try:
                         await self._client.cancel_order(
@@ -787,7 +618,7 @@ class ChaseOrderManager:
                         pass
                     state.current_order_id = None
         
-        # Check again if fully filled after aggregating
+        # Check again if fully filled
         if state.is_fully_filled:
             state.status = "filled"
             state.fill_price = state.current_price
@@ -797,137 +628,104 @@ class ChaseOrderManager:
         if remaining <= 0:
             state.status = "filled"
             return
-        
-        # Check minimum order size (Phemex min is ~0.01 SOL or $5 notional)
-        # If remaining is too small, consider it filled
-        MIN_ORDER_SIZE = 0.01
-        if remaining < MIN_ORDER_SIZE:
-            logger.info(
-                f"[{chase_id}] Remaining {remaining:.4f} below minimum, "
-                f"considering filled (total: {state.total_filled:.4f})"
-            )
-            state.status = "filled"
-            state.fill_price = state.current_price
-            return
-        
-        # Place NEW order (no existing order or amend failed)
-        try:
-            result = await self._client.place_limit_post_only(
-                symbol=config.symbol,
-                side=config.side,
-                amount=remaining,
-                price=target_price,
-                reduce_only=config.reduce_only,
-                position_side=config.position_side,
-            )
             
-            state.current_order_id = result.order_id
-            state.current_price = target_price
-            state.fill_amount = 0.0
-            state.last_amend_time = time.time()
-            state.retry_count += 1
-            
-            # Check if order was immediately rejected or filled
-            # PostOnly orders can be rejected if they would cross the spread
-            if result.status in ("rejected", "canceled", "expired"):
-                logger.warning(
-                    f"[{chase_id}] Order was {result.status} immediately. "
-                    f"Price {target_price} may have crossed spread."
-                )
-                state.current_order_id = None
-                return
-            
-            # Check if order was immediately filled
-            if result.status in ("closed", "filled") and result.filled > 0:
-                state.total_filled += result.filled
-                state.fill_price = result.average or target_price
+        # Place NEW order
+        if state.current_order_id is None:
+            # Check minimum order size
+            MIN_ORDER_SIZE = 0.01
+            if remaining < MIN_ORDER_SIZE:
                 logger.info(
-                    f"[{chase_id}] Order filled immediately: "
-                    f"+{result.filled:.4f}, Total: {state.total_filled:.4f}"
-                )
-                state.current_order_id = None
-                return
-            
-            logger.info(
-                f"[{chase_id}] NEW #{state.retry_count}: "
-                f"{config.side.upper()} {remaining:.4f} @ {target_price:.4f}"
-            )
-            
-        except Exception as e:
-            error_str = str(e)
-            
-            # TE_QTY_TOO_SMALL = remaining is below minimum, consider filled
-            if "TE_QTY_TOO_SMALL" in error_str or "11058" in error_str:
-                logger.info(
-                    f"[{chase_id}] Quantity too small ({remaining:.4f}), "
-                    f"considering filled (total: {state.total_filled:.4f})"
+                    f"[{chase_id}] Remaining {remaining:.4f} below minimum, "
+                    f"considering filled"
                 )
                 state.status = "filled"
                 state.fill_price = state.current_price
                 return
-            
-            if "TE_REDUCE_ONLY_ABORT" in error_str or "11011" in error_str:
-                logger.info(f"[{chase_id}] Position already closed (reduce_only abort)")
-                state.status = "filled"
-                state.total_filled = config.amount
-                return
-            
-            logger.warning(f"[{chase_id}] Order failed: {e}")
-            await asyncio.sleep(0.5)
+
+            try:
+                result = await self._client.place_limit_post_only(
+                    symbol=config.symbol,
+                    side=config.side,
+                    amount=remaining,
+                    price=target_price,
+                    reduce_only=config.reduce_only,
+                    position_side=config.position_side,
+                )
+                
+                state.current_order_id = result.order_id
+                state.current_price = target_price
+                state.fill_amount = 0.0
+                state.last_amend_time = time.time()
+                state.retry_count += 1
+                
+                if result.status in ("rejected", "canceled", "expired"):
+                    logger.warning(
+                        f"[{chase_id}] Order was {result.status} immediately. "
+                        f"Price {target_price} may have crossed spread."
+                    )
+                    state.current_order_id = None
+                    return
+                
+                if result.status in ("closed", "filled") and result.filled > 0:
+                    state.total_filled += result.filled
+                    state.fill_price = result.average or target_price
+                    logger.info(
+                        f"[{chase_id}] Order filled immediately: "
+                        f"+{result.filled:.4f}, Total: {state.total_filled:.4f}"
+                    )
+                    state.current_order_id = None
+                    return
+                
+                logger.info(
+                    f"[{chase_id}] NEW #{state.retry_count}: "
+                    f"{config.side.upper()} {remaining:.4f} @ {target_price:.4f}"
+                )
+                
+            except Exception as e:
+                error_str = str(e)
+                if "TE_QTY_TOO_SMALL" in error_str or "11058" in error_str:
+                    logger.info(
+                        f"[{chase_id}] Quantity too small ({remaining:.4f}), "
+                        f"considering filled"
+                    )
+                    state.status = "filled"
+                    state.fill_price = state.current_price
+                    return
+                
+                if "TE_REDUCE_ONLY_ABORT" in error_str or "11011" in error_str:
+                    logger.info(f"[{chase_id}] Position already closed (reduce_only abort)")
+                    state.status = "filled"
+                    state.total_filled = config.amount
+                    return
+                
+                logger.warning(f"[{chase_id}] Order failed: {e}")
+                await asyncio.sleep(0.5)
     
     async def _check_order_filled(self, chase_id: str) -> bool:
         """
         Check if order is filled via WebSocket cache.
-        
-        Uses ONLY WebSocket order updates for fill detection.
-        The order cache is populated by _stream_orders().
-        
-        Aggregates partial fills to total_filled.
-        Returns True when fully filled.
         """
         state = self._active_chases[chase_id]
-        
         if not state.current_order_id:
             return False
-        
-        # Get order update from WebSocket cache
-        order_update = self._order_updates.get(state.current_order_id)
-        
+            
+        order_update = self._ws_manager.get_order_update(state.current_order_id)
         if not order_update:
-            # Order not in cache yet - wait for WS update
             return False
+            
+        filled = order_update.get("filled", 0.0)
+        remaining = order_update.get("remaining", 0.0)
+        status = order_update.get("status")
         
-        status = order_update.get("status", "")
-        filled = float(order_update.get("filled", 0.0))
-        
-        # Aggregate new fills
+        # Update state
         if filled > state.fill_amount:
-            additional = filled - state.fill_amount
-            state.total_filled += additional
+            added = filled - state.fill_amount
+            state.total_filled += added
             state.fill_amount = filled
-            logger.info(
-                f"[{chase_id}] Fill detected: +{additional:.4f}, "
-                f"Total: {state.total_filled:.4f}/{state.config.amount:.4f}"
-            )
-        
-        # Check if order is closed/filled
-        if status in ("closed", "filled"):
-            if filled > 0:
-                state.fill_price = order_update.get("average") or state.current_price
-                logger.info(
-                    f"[{chase_id}] Order {state.current_order_id[:8]}... "
-                    f"filled: {filled:.4f} @ {state.fill_price:.4f}"
-                )
-            return state.is_fully_filled
-        
-        # Order was canceled or rejected
-        if status in ("canceled", "rejected", "expired"):
-            logger.warning(
-                f"[{chase_id}] Order {state.current_order_id[:8]}... "
-                f"was {status} with filled={filled:.4f}"
-            )
-            # Clear order ID so we place a new one
-            state.current_order_id = None
-            return state.is_fully_filled
-        
+            logger.info(f"[{chase_id}] Fill detected: +{added:.4f}")
+            
+        if status == "filled" or remaining == 0:
+            state.fill_price = order_update.get("average") or state.current_price
+            return True
+            
         return False

@@ -19,7 +19,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from phemex_client.exchange_client import PhemexClient
+from phemex_client.exchange_client import PhemexClient, truncate_to_step_size
 from phemex_client.position_manager import PositionManager
 from phemex_client.chase_order_manager import ChaseOrderManager
 from phemex_client.models import PositionState, Direction, ChaseOrderConfig
@@ -98,7 +98,7 @@ class SignalProcessor:
         contracts = target_notional / entry_price
         
         # Round to reasonable precision
-        return round(contracts, 6)
+        return truncate_to_step_size(contracts)
     
     async def process_signal(self, message: dict) -> None:
         """

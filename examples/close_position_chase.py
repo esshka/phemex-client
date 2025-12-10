@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.models import ChaseOrderConfig
 
 
@@ -108,15 +109,21 @@ async def close_position_with_chase() -> None:
             close_side = "buy"
             position_side = "short"
         
-        # Get singleton chase manager
-        chase_manager = ChaseOrderManager.get_instance(client)
+        # Get singleton websocket manager
+        ws_manager = WebsocketManager.get_instance(client)
         
-        # Warmup: establish WS connections
-        logger.info("\nWarming up ChaseOrderManager...")
-        await chase_manager.warmup([SYMBOL])
+        # Start WS streaming
+        logger.info("\nStarting WebsocketManager...")
+        await ws_manager.start([SYMBOL])
+        
+        # Get singleton chase manager
+        chase_manager = ChaseOrderManager.get_instance(client, ws_manager)
+        
+        # Start chase manager
+        await chase_manager.start()
         
         # Get current cached prices
-        prices = chase_manager.get_prices(SYMBOL)
+        prices = ws_manager.get_prices(SYMBOL)
         if prices:
             logger.info(f"\nCurrent Market:")
             logger.info(f"   Bid1: ${prices['bid1']:.4f}")
@@ -158,7 +165,7 @@ async def close_position_with_chase() -> None:
                 break
             
             # Log current status
-            prices = chase_manager.get_prices(SYMBOL)
+            prices = ws_manager.get_prices(SYMBOL)
             if prices:
                 ref_price = prices['ask1'] if close_side == 'sell' else prices['bid1']
                 logger.info(
@@ -188,8 +195,11 @@ async def close_position_with_chase() -> None:
     finally:
         if chase_manager:
             await chase_manager.shutdown()
+        if 'ws_manager' in locals() and ws_manager:
+            await ws_manager.stop()
         await client.close()
         ChaseOrderManager.reset_instance()
+        WebsocketManager.reset_instance()
         logger.info("\nDone!")
 
 
