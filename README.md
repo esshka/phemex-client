@@ -67,6 +67,18 @@ Or with a custom config path:
 poetry run python examples/run_listener.py --config /path/to/config.yml
 ```
 
+### Log Account Status and Price
+
+Simple example to check account balance and current market price:
+
+```bash
+poetry run python examples/log_account_and_price.py
+```
+
+This will display:
+- Account balance (total, free, used margin)
+- SOLUSDT perpetual price (last, bid, ask, 24h stats, mark price, funding rate)
+
 ### Send Test Signals
 
 ```bash
@@ -158,8 +170,9 @@ phemex-client/
 │   └── zmq_listener.py       # ZMQ subscriber
 │
 ├── examples/
-│   ├── run_listener.py       # Main entry point
-│   └── send_test_signal.py   # Test publisher
+│   ├── run_listener.py          # Main entry point
+│   ├── send_test_signal.py      # Test publisher
+│   └── log_account_and_price.py # Account status & price logger
 │
 └── tests/
     └── ...
