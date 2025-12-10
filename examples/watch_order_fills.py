@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 async def watch_order_fills(filter_order_id: str | None = None) -> None:
     """
-    Watch all order updates and log them.
+    Watch for new orders and report fills for tracked orders.
     
     Args:
         filter_order_id: If provided, only show updates for this order ID
@@ -61,6 +61,12 @@ async def watch_order_fills(filter_order_id: str | None = None) -> None:
         sandbox=config.phemex.testnet,
     )
     
+    # Track known orders: order_id -> {last_filled, status}
+    tracked_orders: dict[str, dict] = {}
+    
+    # Skip first batch of historical orders
+    first_batch_received = False
+    
     try:
         # Initialize exchange
         await client.initialize([SYMBOL], leverage=20)
@@ -72,6 +78,20 @@ async def watch_order_fills(filter_order_id: str | None = None) -> None:
         while True:
             try:
                 orders = await client.watch_orders(SYMBOL)
+                
+                # Skip the first batch entirely (historical orders)
+                if not first_batch_received:
+                    first_batch_received = True
+                    # Mark all current order IDs as "known" but don't log them
+                    for order in orders:
+                        order_id = order.get("id", "unknown")
+                        tracked_orders[order_id] = {
+                            "last_filled": order.get("filled", 0),
+                            "status": order.get("status", "unknown"),
+                        }
+                    logger.info(f"Skipped {len(orders)} historical orders")
+                    logger.info("Now watching for NEW orders only...\n")
+                    continue
                 
                 for order in orders:
                     order_id = order.get("id", "unknown")
@@ -89,26 +109,52 @@ async def watch_order_fills(filter_order_id: str | None = None) -> None:
                     remaining = order.get("remaining", 0)
                     average = order.get("average")
                     
-                    logger.info("-" * 50)
-                    logger.info(f"ORDER UPDATE RECEIVED:")
-                    logger.info(f"  ID: {order_id}")
-                    logger.info(f"  Status: {status}")
-                    logger.info(f"  Side: {side}")
-                    logger.info(f"  Type: {order_type}")
-                    logger.info(f"  Price: {price}")
-                    logger.info(f"  Amount: {amount}")
-                    logger.info(f"  Filled: {filled}")
-                    logger.info(f"  Remaining: {remaining}")
-                    logger.info(f"  Average: {average}")
+                    # Check if this is a NEW order
+                    if order_id not in tracked_orders:
+                        # Skip orders that are NOT open (already completed)
+                        if status != "open":
+                            continue
+                        
+                        tracked_orders[order_id] = {
+                            "last_filled": filled,  # Start from current fill
+                            "status": status,
+                        }
+                        logger.info("-" * 50)
+                        logger.info(f"NEW ORDER DETECTED:")
+                        logger.info(f"  ID: {order_id}")
+                        logger.info(f"  Side: {side.upper()}")
+                        logger.info(f"  Type: {order_type}")
+                        logger.info(f"  Price: {price}")
+                        logger.info(f"  Amount: {amount}")
+                        logger.info(f"  Status: {status}")
+                        continue  # Don't process fills for initial detection
                     
-                    # Highlight fills
-                    if filled > 0:
-                        logger.info(f"  >>> FILL DETECTED: {filled} @ {average}")
+                    # Check for new fills on tracked orders
+                    last_filled = tracked_orders[order_id]["last_filled"]
                     
-                    if status in ("closed", "filled"):
-                        logger.info(f"  >>> ORDER COMPLETED")
-                    elif status == "canceled":
-                        logger.info(f"  >>> ORDER CANCELED")
+                    if filled > last_filled:
+                        new_fill = filled - last_filled
+                        tracked_orders[order_id]["last_filled"] = filled
+                        
+                        logger.info("-" * 50)
+                        logger.info(f"FILL DETECTED:")
+                        logger.info(f"  ID: {order_id}")
+                        logger.info(f"  Side: {side.upper()}")
+                        logger.info(f"  New Fill: +{new_fill:.4f}")
+                        logger.info(f"  Total Filled: {filled:.4f}/{amount:.4f}")
+                        logger.info(f"  Fill Price: {average}")
+                        logger.info(f"  Remaining: {remaining:.4f}")
+                        
+                        if status in ("closed", "filled"):
+                            logger.info(f"  >>> ORDER FULLY FILLED")
+                    
+                    # Track status changes
+                    if status != tracked_orders[order_id]["status"]:
+                        old_status = tracked_orders[order_id]["status"]
+                        tracked_orders[order_id]["status"] = status
+                        
+                        if status == "canceled":
+                            logger.info(f"  >>> ORDER {order_id[:8]}... CANCELED")
                         
             except asyncio.CancelledError:
                 raise

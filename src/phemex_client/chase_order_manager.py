@@ -87,7 +87,7 @@ class ChaseOrderManager:
         
         # Background tasks
         self._orderbook_tasks: dict[str, asyncio.Task] = {}
-        self._order_stream_task: Optional[asyncio.Task] = None
+        self._order_stream_tasks: dict[str, asyncio.Task] = {}  # Per-symbol order streams
         self._chase_tasks: dict[str, asyncio.Task] = {}
         
         # Command queue for submitting chase orders
@@ -97,6 +97,7 @@ class ChaseOrderManager:
         # State
         self._warmed_up = False
         self._running = False
+        self._symbols: list[str] = []  # Symbols we're tracking
     
     @property
     def is_warmed_up(self) -> bool:
@@ -123,8 +124,14 @@ class ChaseOrderManager:
             task = asyncio.create_task(self._stream_orderbook(symbol))
             self._orderbook_tasks[symbol] = task
         
-        # Start order updates stream (for fill detection)
-        self._order_stream_task = asyncio.create_task(self._stream_orders())
+        # Store symbols for order streaming
+        self._symbols = symbols
+        
+        # Start order updates stream for each symbol (for fill detection)
+        # Phemex requires symbol for WebSocket order subscriptions
+        for symbol in symbols:
+            task = asyncio.create_task(self._stream_orders(symbol))
+            self._order_stream_tasks[symbol] = task
         
         # Wait for initial prices
         for symbol in symbols:
@@ -159,10 +166,10 @@ class ChaseOrderManager:
             task.cancel()
         self._orderbook_tasks.clear()
         
-        # Cancel order stream
-        if self._order_stream_task:
-            self._order_stream_task.cancel()
-            self._order_stream_task = None
+        # Cancel order streams
+        for task in self._order_stream_tasks.values():
+            task.cancel()
+        self._order_stream_tasks.clear()
         
         # Cancel command processor
         if self._command_processor_task:
@@ -306,18 +313,19 @@ class ChaseOrderManager:
         
         logger.debug(f"Orderbook stream stopped for {symbol}")
     
-    async def _stream_orders(self) -> None:
+    async def _stream_orders(self, symbol: str) -> None:
         """
-        Stream order updates via WebSocket.
+        Stream order updates via WebSocket for a specific symbol.
         
         Caches order status for real-time fill detection.
+        Phemex requires symbol to be specified for order subscriptions.
         """
-        logger.debug("Starting order stream")
+        logger.info(f"Starting order stream for {symbol}")
         
         try:
             while True:
                 try:
-                    orders = await self._client.watch_orders()
+                    orders = await self._client.watch_orders(symbol)
                     
                     # Update order cache with latest status
                     for order in orders:
@@ -333,22 +341,21 @@ class ChaseOrderManager:
                                 "average": order.get("average"),
                             }
                             
-                            # Log order updates for debugging
-                            if filled > 0 or status in ("closed", "filled", "canceled"):
-                                logger.info(
-                                    f"WS order update: {order_id[:8]}... "
-                                    f"status={status} filled={filled}"
-                                )
+                            # Log ALL order updates (not just fills) for debugging
+                            logger.info(
+                                f"WS order: {order_id[:8]}... "
+                                f"status={status} filled={filled}"
+                            )
                     
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"Order stream error: {e}")
+                    logger.warning(f"Order stream error for {symbol}: {e}")
                     await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             pass
         
-        logger.debug("Order stream stopped")
+        logger.info(f"Order stream stopped for {symbol}")
     
     async def _process_commands(self) -> None:
         """
@@ -399,12 +406,28 @@ class ChaseOrderManager:
     async def _chase_loop(self, chase_id: str) -> None:
         """
         Main chase loop - reads cached prices and updates order.
+        
+        CRITICAL: Check if filled FIRST, before placing any new orders.
         """
         state = self._active_chases[chase_id]
         config = state.config
         
         try:
             while state.status == "active" and self._running:
+                # CRITICAL: Check WebSocket cache for fills FIRST
+                # This prevents placing new orders when previous one was filled
+                if state.current_order_id:
+                    if await self._check_order_filled(chase_id):
+                        state.status = "filled"
+                        logger.info(f"[{chase_id}] Filled at {state.fill_price}")
+                        break
+                
+                # Also check if fully filled from accumulated partial fills
+                if state.is_fully_filled:
+                    state.status = "filled"
+                    logger.info(f"[{chase_id}] Fully filled (accumulated): {state.total_filled:.4f}")
+                    break
+                
                 # Get cached prices (instant, no WS wait)
                 prices = self._prices.get(config.symbol)
                 
@@ -425,14 +448,12 @@ class ChaseOrderManager:
                 # Check if we need to place/update order
                 if self._needs_update(state, target_price):
                     await self._update_order(chase_id, target_price)
-                
-                # Check if filled (tries WS cache, then REST API fallback)
-                if state.current_order_id:
-                    if await self._check_order_filled(chase_id):
+                    
+                    # Re-check fill after update (order might have filled immediately)
+                    if state.is_fully_filled:
                         state.status = "filled"
-                        logger.info(f"[{chase_id}] Filled at {state.fill_price}")
+                        logger.info(f"[{chase_id}] Filled immediately!")
                         break
-                
                 
                 # Chase interval: 1 second between checks
                 await asyncio.sleep(1.0)
@@ -621,22 +642,87 @@ class ChaseOrderManager:
             except Exception as e:
                 error_str = str(e)
                 
-                # ORDER_NOT_FOUND = order was already filled or canceled
+                # ORDER_NOT_FOUND = order was already filled, canceled, or rejected
+                # Check WebSocket cache FIRST, then REST API as fallback
                 if "ORDER_NOT_FOUND" in error_str or "10002" in error_str:
-                    order_update = self._order_updates.get(state.current_order_id)
-                    ws_has_fill = order_update and order_update.get("filled", 0.0) > 0
+                    order_id_to_check = state.current_order_id
                     
-                    if not ws_has_fill and state.fill_amount == 0:
-                        remaining_on_order = state.remaining_amount
-                        state.total_filled += remaining_on_order
-                        state.fill_price = state.current_price
+                    # Step 1: Check WebSocket cache
+                    order_update = self._order_updates.get(order_id_to_check)
+                    ws_filled = order_update.get("filled", 0.0) if order_update else 0.0
+                    ws_status = order_update.get("status", "") if order_update else ""
+                    
+                    # Step 2: If WS has no info, use REST API as fallback
+                    if not order_update or ws_status == "":
+                        logger.info(f"[{chase_id}] WS cache empty, checking REST API...")
+                        rest_order = await self._client.fetch_order(
+                            order_id_to_check,
+                            config.symbol,
+                        )
+                        if rest_order:
+                            ws_filled = float(rest_order.get("filled", 0.0))
+                            ws_status = rest_order.get("status", "")
+                            # Update cache with REST data
+                            self._order_updates[order_id_to_check] = {
+                                "status": ws_status,
+                                "filled": ws_filled,
+                                "remaining": rest_order.get("remaining", 0.0),
+                                "average": rest_order.get("average"),
+                            }
+                            logger.info(
+                                f"[{chase_id}] REST API: status={ws_status}, filled={ws_filled}"
+                            )
+                    
+                    # Step 3: Process fill info
+                    if ws_filled > state.fill_amount:
+                        # Confirmed fill
+                        additional = ws_filled - state.fill_amount
+                        state.total_filled += additional
+                        state.fill_amount = ws_filled
+                        avg_price = (
+                            order_update.get("average") if order_update 
+                            else state.current_price
+                        )
+                        state.fill_price = avg_price or state.current_price
                         logger.info(
-                            f"[{chase_id}] Order filled (not found on amend): "
-                            f"+{remaining_on_order:.4f}, Total: {state.total_filled:.4f}"
+                            f"[{chase_id}] Fill confirmed: "
+                            f"+{additional:.4f}, Total: {state.total_filled:.4f}"
+                        )
+                        # Check if fully filled and return immediately
+                        if state.is_fully_filled:
+                            state.status = "filled"
+                            logger.info(f"[{chase_id}] Fully filled! Stopping chase.")
+                            return
+                    elif ws_status in ("closed", "filled"):
+                        # Order is closed but we didn't detect any new fill
+                        # This means order was fully filled before we checked
+                        logger.info(
+                            f"[{chase_id}] Order {order_id_to_check[:8]}... "
+                            f"is {ws_status}, assuming filled"
+                        )
+                        state.total_filled = config.amount
+                        state.status = "filled"
+                        return
+                    else:
+                        # No fill detected - order was canceled/rejected
+                        logger.warning(
+                            f"[{chase_id}] Order {order_id_to_check[:8]}... "
+                            f"not found, status={ws_status}, filled={ws_filled}"
                         )
                     
                     # Clear order ID, will place new order below
                     state.current_order_id = None
+                
+                # Minimum amount precision error = remaining too small, consider filled
+                elif "minimum amount precision" in error_str.lower():
+                    logger.info(
+                        f"[{chase_id}] Remaining {remaining:.4f} below minimum precision, "
+                        f"considering filled (total: {state.total_filled:.4f})"
+                    )
+                    state.status = "filled"
+                    state.fill_price = state.current_price
+                    return
+                
                 else:
                     # Other amend errors - try cancel+place
                     logger.warning(f"[{chase_id}] Amend failed, will cancel+place: {e}")
@@ -661,6 +747,18 @@ class ChaseOrderManager:
             state.status = "filled"
             return
         
+        # Check minimum order size (Phemex min is ~0.01 SOL or $5 notional)
+        # If remaining is too small, consider it filled
+        MIN_ORDER_SIZE = 0.01
+        if remaining < MIN_ORDER_SIZE:
+            logger.info(
+                f"[{chase_id}] Remaining {remaining:.4f} below minimum, "
+                f"considering filled (total: {state.total_filled:.4f})"
+            )
+            state.status = "filled"
+            state.fill_price = state.current_price
+            return
+        
         # Place NEW order (no existing order or amend failed)
         try:
             result = await self._client.place_limit_post_only(
@@ -678,6 +776,27 @@ class ChaseOrderManager:
             state.last_amend_time = time.time()
             state.retry_count += 1
             
+            # Check if order was immediately rejected or filled
+            # PostOnly orders can be rejected if they would cross the spread
+            if result.status in ("rejected", "canceled", "expired"):
+                logger.warning(
+                    f"[{chase_id}] Order was {result.status} immediately. "
+                    f"Price {target_price} may have crossed spread."
+                )
+                state.current_order_id = None
+                return
+            
+            # Check if order was immediately filled
+            if result.status in ("closed", "filled") and result.filled > 0:
+                state.total_filled += result.filled
+                state.fill_price = result.average or target_price
+                logger.info(
+                    f"[{chase_id}] Order filled immediately: "
+                    f"+{result.filled:.4f}, Total: {state.total_filled:.4f}"
+                )
+                state.current_order_id = None
+                return
+            
             logger.info(
                 f"[{chase_id}] NEW #{state.retry_count}: "
                 f"{config.side.upper()} {remaining:.4f} @ {target_price:.4f}"
@@ -685,6 +804,16 @@ class ChaseOrderManager:
             
         except Exception as e:
             error_str = str(e)
+            
+            # TE_QTY_TOO_SMALL = remaining is below minimum, consider filled
+            if "TE_QTY_TOO_SMALL" in error_str or "11058" in error_str:
+                logger.info(
+                    f"[{chase_id}] Quantity too small ({remaining:.4f}), "
+                    f"considering filled (total: {state.total_filled:.4f})"
+                )
+                state.status = "filled"
+                state.fill_price = state.current_price
+                return
             
             if "TE_REDUCE_ONLY_ABORT" in error_str or "11011" in error_str:
                 logger.info(f"[{chase_id}] Position already closed (reduce_only abort)")
@@ -697,10 +826,10 @@ class ChaseOrderManager:
     
     async def _check_order_filled(self, chase_id: str) -> bool:
         """
-        Check if order is filled.
+        Check if order is filled via WebSocket cache.
         
-        First checks WebSocket order cache, then falls back to REST API
-        if order is not in cache (Phemex WS can miss updates).
+        Uses ONLY WebSocket order updates for fill detection.
+        The order cache is populated by _stream_orders().
         
         Aggregates partial fills to total_filled.
         Returns True when fully filled.
@@ -710,75 +839,44 @@ class ChaseOrderManager:
         if not state.current_order_id:
             return False
         
-        # Check WebSocket order cache first
+        # Get order update from WebSocket cache
         order_update = self._order_updates.get(state.current_order_id)
         
-        # If not in WS cache, try REST API to fetch actual order status
         if not order_update:
-            try:
-                # Fetch the actual order by ID to get real status
-                order = await self._client._exchange.fetch_order(
-                    state.current_order_id,
-                    state.config.symbol,
-                )
-                
-                status = order.get("status", "")
-                filled = float(order.get("filled", 0.0))
-                
-                logger.debug(
-                    f"[{chase_id}] Fetched order {state.current_order_id[:8]}... "
-                    f"status={status} filled={filled}"
-                )
-                
-                # Aggregate fills
-                if filled > state.fill_amount:
-                    additional = filled - state.fill_amount
-                    state.total_filled += additional
-                    state.fill_amount = filled
-                
-                # Check if actually filled
-                if status in ("closed", "filled") and filled > 0:
-                    state.fill_price = order.get("average") or state.current_price
-                    logger.info(
-                        f"[{chase_id}] Order {state.current_order_id[:8]}... "
-                        f"filled: {filled} @ {state.fill_price}"
-                    )
-                    return state.is_fully_filled
-                
-                # Order was canceled or rejected (not filled)
-                if status in ("canceled", "rejected", "expired"):
-                    logger.warning(
-                        f"[{chase_id}] Order {state.current_order_id[:8]}... "
-                        f"was {status}, not filled"
-                    )
-                    state.current_order_id = None  # Clear so we place new order
-                    return False
-                    
-            except Exception as e:
-                logger.debug(f"[{chase_id}] fetch_order failed: {e}")
-            
+            # Order not in cache yet - wait for WS update
             return False
         
         status = order_update.get("status", "")
-        filled = order_update.get("filled", 0.0)
+        filled = float(order_update.get("filled", 0.0))
         
-        # Aggregate any new fills
+        # Aggregate new fills
         if filled > state.fill_amount:
-            additional_fill = filled - state.fill_amount
-            state.total_filled += additional_fill
+            additional = filled - state.fill_amount
+            state.total_filled += additional
             state.fill_amount = filled
+            logger.info(
+                f"[{chase_id}] Fill detected: +{additional:.4f}, "
+                f"Total: {state.total_filled:.4f}/{state.config.amount:.4f}"
+            )
         
-        # Check if fully filled (considering all orders)
-        if state.is_fully_filled:
-            state.fill_price = order_update.get("average") or state.current_price
-            return True
-        
-        # Check for current order closed
-        if status == "closed" or status == "filled":
-            # Aggregate final fill
+        # Check if order is closed/filled
+        if status in ("closed", "filled"):
             if filled > 0:
                 state.fill_price = order_update.get("average") or state.current_price
-            # Check if this completes the total
+                logger.info(
+                    f"[{chase_id}] Order {state.current_order_id[:8]}... "
+                    f"filled: {filled:.4f} @ {state.fill_price:.4f}"
+                )
+            return state.is_fully_filled
+        
+        # Order was canceled or rejected
+        if status in ("canceled", "rejected", "expired"):
+            logger.warning(
+                f"[{chase_id}] Order {state.current_order_id[:8]}... "
+                f"was {status} with filled={filled:.4f}"
+            )
+            # Clear order ID so we place a new one
+            state.current_order_id = None
             return state.is_fully_filled
         
         return False

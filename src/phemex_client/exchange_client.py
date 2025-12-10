@@ -359,6 +359,31 @@ class PhemexClient:
         """
         return await self.exchange.fetch_open_orders(symbol)
     
+    async def fetch_order(
+        self,
+        order_id: str,
+        symbol: str,
+    ) -> Optional[dict]:
+        """
+        Fetch a specific order by ID.
+        
+        Useful for checking order status when WebSocket cache doesn't have it.
+        
+        Args:
+            order_id: Order ID to fetch
+            symbol: Trading symbol
+        
+        Returns:
+            Order dict if found, None if not found
+        """
+        try:
+            return await self.exchange.fetch_order(order_id, symbol)
+        except Exception as e:
+            if "ORDER_NOT_FOUND" in str(e) or "10002" in str(e):
+                return None
+            logger.warning(f"Fetch order {order_id} failed: {e}")
+            return None
+    
     async def watch_positions(self):
         """
         Watch positions via WebSocket.
