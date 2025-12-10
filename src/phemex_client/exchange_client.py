@@ -107,6 +107,7 @@ class PhemexClient:
         amount: float,
         price: float,
         reduce_only: bool = False,
+        position_side: Optional[str] = None,
     ) -> OrderResult:
         """
         Place a limit post-only order.
@@ -120,6 +121,7 @@ class PhemexClient:
             amount: Order size in contracts
             price: Limit price
             reduce_only: If True, order can only reduce position
+            position_side: For hedge mode: 'long' or 'short'. None for one-way mode.
         
         Returns:
             OrderResult with order details
@@ -128,6 +130,10 @@ class PhemexClient:
             "postOnly": True,
             "reduceOnly": reduce_only,
         }
+        
+        # Add position side for hedge mode
+        if position_side:
+            params["posSide"] = position_side.capitalize()  # 'Long' or 'Short'
         
         order = await self._create_order_with_retry(
             symbol=symbol,
@@ -240,19 +246,29 @@ class PhemexClient:
             logger.error(f"Cancel all orders failed for {symbol}: {e}")
             return []
     
-    async def cancel_order(self, order_id: str, symbol: str) -> dict:
+    async def cancel_order(
+        self,
+        order_id: str,
+        symbol: str,
+        position_side: Optional[str] = None,
+    ) -> dict:
         """
         Cancel a specific order.
         
         Args:
             order_id: Order ID to cancel
             symbol: Trading symbol
+            position_side: For hedge mode: 'long' or 'short'. None for one-way mode.
         
         Returns:
             Cancelled order response
         """
         try:
-            result = await self.exchange.cancel_order(order_id, symbol)
+            params = {}
+            if position_side:
+                params["posSide"] = position_side.capitalize()
+            
+            result = await self.exchange.cancel_order(order_id, symbol, params)
             logger.info(f"Cancelled order {order_id}")
             return result
         except Exception as e:

@@ -1,21 +1,17 @@
 # tests/test_chase_order_manager.py
-# Unit tests for ChaseOrderManager class
-# Tests price calculation, chase limits, and order lifecycle
+# Unit tests for ChaseOrderManager singleton
+# Tests price calculation, singleton pattern, and basic operations
 # RELEVANT FILES: chase_order_manager.py, models.py, exchange_client.py
 
 """
-Tests for ChaseOrderManager.
+Tests for ChaseOrderManager singleton.
 
-Uses mocked exchange client to test:
-- Target price calculation for different chase modes
-- Max retries limit
-- Max chase distance limit
-- Order fill detection
+Focuses on unit tests that don't require full async lifecycle.
 """
 
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 import sys
 from pathlib import Path
 
@@ -23,7 +19,35 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from phemex_client.chase_order_manager import ChaseOrderManager
-from phemex_client.models import ChaseOrderConfig, OrderResult
+from phemex_client.models import ChaseOrderConfig, ChaseOrderState, OrderResult
+
+
+class TestSingletonPattern:
+    """Tests for singleton pattern."""
+    
+    def teardown_method(self):
+        """Reset singleton after each test."""
+        ChaseOrderManager.reset_instance()
+    
+    def test_get_instance_returns_same_object(self):
+        """Test get_instance returns same instance."""
+        exchange = MagicMock()
+        
+        instance1 = ChaseOrderManager.get_instance(exchange)
+        instance2 = ChaseOrderManager.get_instance(exchange)
+        
+        assert instance1 is instance2
+    
+    def test_reset_instance_clears_singleton(self):
+        """Test reset_instance allows new instance."""
+        exchange1 = MagicMock()
+        exchange2 = MagicMock()
+        
+        instance1 = ChaseOrderManager.get_instance(exchange1)
+        ChaseOrderManager.reset_instance()
+        instance2 = ChaseOrderManager.get_instance(exchange2)
+        
+        assert instance1 is not instance2
 
 
 class TestPriceCalculation:
@@ -33,9 +57,19 @@ class TestPriceCalculation:
         """Set up test fixtures."""
         self.exchange = MagicMock()
         self.manager = ChaseOrderManager(self.exchange)
+        # Standard prices dict for tests
+        self.prices = {
+            "bid1": 100.0,
+            "bid2": 99.9,
+            "ask1": 100.5,
+            "ask2": 100.6,
+        }
     
-    def test_bid1_mode_buy(self):
-        """Test bid1 mode returns best bid for buys."""
+    def teardown_method(self):
+        ChaseOrderManager.reset_instance()
+    
+    def test_bid1_mode(self):
+        """Test bid1 mode returns best bid."""
         config = ChaseOrderConfig(
             symbol="SOL/USDT:USDT",
             side="buy",
@@ -43,14 +77,23 @@ class TestPriceCalculation:
             chase_mode="bid1",
         )
         
-        price = self.manager._calculate_target_price(
-            config, bid1=100.0, ask1=100.5
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 100.0
+    
+    def test_bid2_mode(self):
+        """Test bid2 mode returns second best bid."""
+        config = ChaseOrderConfig(
+            symbol="SOL/USDT:USDT",
+            side="buy",
+            amount=1.0,
+            chase_mode="bid2",
         )
         
-        assert price == 100.0  # bids[0]
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 99.9
     
-    def test_ask1_mode_sell(self):
-        """Test ask1 mode returns best ask for sells."""
+    def test_ask1_mode(self):
+        """Test ask1 mode returns best ask."""
         config = ChaseOrderConfig(
             symbol="SOL/USDT:USDT",
             side="sell",
@@ -58,11 +101,44 @@ class TestPriceCalculation:
             chase_mode="ask1",
         )
         
-        price = self.manager._calculate_target_price(
-            config, bid1=100.0, ask1=100.5
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 100.5
+    
+    def test_ask2_mode(self):
+        """Test ask2 mode returns second best ask."""
+        config = ChaseOrderConfig(
+            symbol="SOL/USDT:USDT",
+            side="sell",
+            amount=1.0,
+            chase_mode="ask2",
         )
         
-        assert price == 100.5  # asks[0]
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 100.6
+    
+    def test_default_mode_buy(self):
+        """Test default mode for buys uses bid2."""
+        config = ChaseOrderConfig(
+            symbol="SOL/USDT:USDT",
+            side="buy",
+            amount=1.0,
+            # No chase_mode = default
+        )
+        
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 99.9  # bid2
+    
+    def test_default_mode_sell(self):
+        """Test default mode for sells uses ask2."""
+        config = ChaseOrderConfig(
+            symbol="SOL/USDT:USDT",
+            side="sell",
+            amount=1.0,
+            # No chase_mode = default
+        )
+        
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 100.6  # ask2
     
     def test_distance_mode_buy(self):
         """Test distance mode for buys: bid1 - distance."""
@@ -74,11 +150,8 @@ class TestPriceCalculation:
             price_distance=0.5,
         )
         
-        price = self.manager._calculate_target_price(
-            config, bid1=100.0, ask1=100.5
-        )
-        
-        assert price == 99.5  # bid1 - distance
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 99.5  # 100.0 - 0.5
     
     def test_distance_mode_sell(self):
         """Test distance mode for sells: ask1 + distance."""
@@ -90,238 +163,245 @@ class TestPriceCalculation:
             price_distance=0.5,
         )
         
-        price = self.manager._calculate_target_price(
-            config, bid1=100.0, ask1=100.5
-        )
-        
-        assert price == 101.0  # ask1 + distance
-
-
-class TestChaseLifecycle:
-    """Tests for chase order lifecycle."""
+        price = self.manager._calculate_target_price(config, self.prices)
+        assert price == 101.0  # 100.5 + 0.5
     
-    def setup_method(self):
-        """Set up test fixtures with async mocks."""
-        self.exchange = MagicMock()
-        
-        # Mock orderbook watching
-        self.orderbook_updates = [
-            {"bids": [[100.0, 10]], "asks": [[100.5, 10]]},
-            {"bids": [[100.1, 10]], "asks": [[100.6, 10]]},
-            {"bids": [[100.2, 10]], "asks": [[100.7, 10]]},
-        ]
-        self.orderbook_index = 0
-        
-        async def mock_watch_order_book(symbol, limit=5):
-            if self.orderbook_index < len(self.orderbook_updates):
-                ob = self.orderbook_updates[self.orderbook_index]
-                self.orderbook_index += 1
-                return ob
-            # Keep returning last orderbook
-            return self.orderbook_updates[-1]
-        
-        self.exchange.watch_order_book = mock_watch_order_book
-        
-        # Mock order placement
-        self.order_count = 0
-        async def mock_place_limit_post_only(**kwargs):
-            self.order_count += 1
-            return OrderResult(
-                order_id=f"order-{self.order_count}",
-                symbol=kwargs["symbol"],
-                side=kwargs["side"],
-                order_type="limit",
-                amount=kwargs["amount"],
-                price=kwargs["price"],
-                status="open",
-            )
-        
-        self.exchange.place_limit_post_only = mock_place_limit_post_only
-        
-        # Mock cancel
-        async def mock_cancel_order(order_id, symbol):
-            return {"id": order_id, "status": "canceled"}
-        
-        self.exchange.cancel_order = mock_cancel_order
-        
-        # Mock open orders (returns empty = order filled)
-        async def mock_fetch_open_orders(symbol):
-            return []  # No open orders = filled
-        
-        self.exchange.fetch_open_orders = mock_fetch_open_orders
-        
-        self.manager = ChaseOrderManager(self.exchange)
-    
-    @pytest.mark.asyncio
-    async def test_start_chase_returns_id(self):
-        """Test start_chase returns a chase ID."""
+    def test_spread_protection_buy_never_crosses(self):
+        """Test buy orders are capped at bid1, never cross to ask1."""
+        # Even with ask1 mode, buy order should be capped at bid1
         config = ChaseOrderConfig(
             symbol="SOL/USDT:USDT",
             side="buy",
             amount=1.0,
-            max_retries=1,  # Low limit for quick test
+            chase_mode="ask1",  # Trying to place at ask1 as a buy
         )
         
-        chase_id = await self.manager.start_chase(config)
-        
-        assert chase_id is not None
-        assert len(chase_id) == 8  # UUID prefix
-        
-        # Wait for first iteration
-        await asyncio.sleep(0.1)
-        
-        # Cancel to clean up
-        await self.manager.cancel_chase(chase_id)
+        price = self.manager._calculate_target_price(config, self.prices)
+        # Should be capped at bid1, not ask1
+        assert price == 100.0
     
-    @pytest.mark.asyncio
-    async def test_cancel_chase_stops_order(self):
-        """Test cancel_chase stops the chase and cancels order."""
+    def test_spread_protection_sell_never_crosses(self):
+        """Test sell orders are floored at ask1, never cross to bid1."""
+        # Even with bid1 mode, sell order should be floored at ask1
         config = ChaseOrderConfig(
             symbol="SOL/USDT:USDT",
-            side="buy",
+            side="sell",
             amount=1.0,
-            max_retries=100,
+            chase_mode="bid1",  # Trying to place at bid1 as a sell
         )
         
-        chase_id = await self.manager.start_chase(config)
-        
-        # Wait for order to be placed
-        await asyncio.sleep(0.2)
-        
-        # Cancel
-        result = await self.manager.cancel_chase(chase_id)
-        
-        assert result is True
-        
-        status = self.manager.get_chase_status(chase_id)
-        assert status["status"] == "canceled"
-    
-    @pytest.mark.asyncio
-    async def test_get_chase_status(self):
-        """Test get_chase_status returns correct info."""
-        config = ChaseOrderConfig(
-            symbol="SOL/USDT:USDT",
-            side="buy",
-            amount=1.5,
-            max_retries=100,
-        )
-        
-        chase_id = await self.manager.start_chase(config)
-        await asyncio.sleep(0.2)
-        
-        status = self.manager.get_chase_status(chase_id)
-        
-        assert status["chase_id"] == chase_id
-        assert status["symbol"] == "SOL/USDT:USDT"
-        assert status["side"] == "buy"
-        assert status["amount"] == 1.5
-        
-        await self.manager.cancel_chase(chase_id)
+        price = self.manager._calculate_target_price(config, self.prices)
+        # Should be floored at ask1, not bid1
+        assert price == 100.5
 
 
-class TestChaseLimits:
-    """Tests for chase limits (max retries, max distance)."""
+class TestChaseState:
+    """Tests for chase state management."""
     
     def setup_method(self):
         """Set up test fixtures."""
         self.exchange = MagicMock()
-        
-        # Moving prices to trigger retries
-        self.prices = [100.0, 100.2, 100.4, 100.6, 100.8, 101.0]
-        self.price_index = 0
-        
-        async def mock_watch_order_book(symbol, limit=5):
-            if self.price_index < len(self.prices):
-                price = self.prices[self.price_index]
-                self.price_index += 1
-            else:
-                price = self.prices[-1]
-            return {"bids": [[price, 10]], "asks": [[price + 0.5, 10]]}
-        
-        self.exchange.watch_order_book = mock_watch_order_book
-        
-        # Track order placements
-        self.placed_orders = []
-        async def mock_place_limit_post_only(**kwargs):
-            order_id = f"order-{len(self.placed_orders) + 1}"
-            self.placed_orders.append((order_id, kwargs["price"]))
-            return OrderResult(
-                order_id=order_id,
-                symbol=kwargs["symbol"],
-                side=kwargs["side"],
-                order_type="limit",
-                amount=kwargs["amount"],
-                price=kwargs["price"],
-                status="open",
-            )
-        
-        self.exchange.place_limit_post_only = mock_place_limit_post_only
-        
-        async def mock_cancel_order(order_id, symbol):
-            return {"id": order_id}
-        
-        self.exchange.cancel_order = mock_cancel_order
-        
-        # Orders stay open (not filled)
-        self.open_order_id = None
-        async def mock_fetch_open_orders(symbol):
-            if self.placed_orders:
-                self.open_order_id = self.placed_orders[-1][0]
-                return [{"id": self.open_order_id, "filled": 0.0}]
-            return []
-        
-        self.exchange.fetch_open_orders = mock_fetch_open_orders
-        
         self.manager = ChaseOrderManager(self.exchange)
     
-    @pytest.mark.asyncio
-    async def test_max_retries_stops_chase(self):
-        """Test chase stops at max retries."""
-        config = ChaseOrderConfig(
-            symbol="SOL/USDT:USDT",
-            side="buy",
-            amount=1.0,
-            chase_mode="bid1",
-            max_retries=3,  # Stop after 3 updates
+    def teardown_method(self):
+        ChaseOrderManager.reset_instance()
+    
+    def test_needs_update_no_order(self):
+        """Test needs_update returns True when no order exists."""
+        state = ChaseOrderState(
+            chase_id="test",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.0,
+            ),
+            current_order_id=None,
+            initial_price=100.0,
+            current_price=0.0,
         )
         
-        chase_id = await self.manager.start_chase(config)
+        assert self.manager._needs_update(state, 100.0) is True
+    
+    def test_needs_update_price_changed(self):
+        """Test needs_update returns True when price changed significantly."""
+        state = ChaseOrderState(
+            chase_id="test",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.0,
+            ),
+            current_order_id="order-1",
+            initial_price=100.0,
+            current_price=100.0,
+        )
         
-        # Wait for chase to complete
-        for _ in range(20):
-            await asyncio.sleep(0.1)
-            status = self.manager.get_chase_status(chase_id)
-            if status["status"] != "active":
-                break
+        # 0.1% change should trigger update (> MIN_PRICE_CHANGE_PCT)
+        assert self.manager._needs_update(state, 100.1) is True
+    
+    def test_needs_update_price_same(self):
+        """Test needs_update returns False when price unchanged."""
+        state = ChaseOrderState(
+            chase_id="test",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.0,
+            ),
+            current_order_id="order-1",
+            initial_price=100.0,
+            current_price=100.0,
+        )
         
-        status = self.manager.get_chase_status(chase_id)
-        assert status["status"] == "stopped"
+        # Same price should not trigger update
+        assert self.manager._needs_update(state, 100.0) is False
+    
+    def test_check_limits_max_retries(self):
+        """Test check_limits returns True at max retries."""
+        state = ChaseOrderState(
+            chase_id="test",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.0,
+                max_retries=5,
+            ),
+            current_order_id="order-1",
+            initial_price=100.0,
+            current_price=100.0,
+            retry_count=5,
+        )
+        self.manager._active_chases["test"] = state
+        
+        result = self.manager._check_limits("test", 100.0)
+        
+        assert result is True
+        assert state.status == "stopped"
+    
+    def test_check_limits_max_distance(self):
+        """Test check_limits returns True when max distance reached."""
+        state = ChaseOrderState(
+            chase_id="test",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.0,
+                max_chase_distance=1.0,
+            ),
+            current_order_id="order-1",
+            initial_price=100.0,
+            current_price=100.0,
+        )
+        self.manager._active_chases["test"] = state
+        
+        # Price moved $1.5 from initial
+        result = self.manager._check_limits("test", 101.5)
+        
+        assert result is True
+        assert state.status == "stopped"
+    
+    def test_check_limits_within_limits(self):
+        """Test check_limits returns False when within limits."""
+        state = ChaseOrderState(
+            chase_id="test",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.0,
+                max_chase_distance=2.0,
+                max_retries=10,
+            ),
+            current_order_id="order-1",
+            initial_price=100.0,
+            current_price=100.0,
+            retry_count=3,
+        )
+        self.manager._active_chases["test"] = state
+        
+        result = self.manager._check_limits("test", 100.5)
+        
+        assert result is False
+        assert state.status == "active"
+
+
+class TestGetStatus:
+    """Tests for status retrieval."""
+    
+    def setup_method(self):
+        self.exchange = MagicMock()
+        self.manager = ChaseOrderManager(self.exchange)
+    
+    def teardown_method(self):
+        ChaseOrderManager.reset_instance()
+    
+    def test_get_chase_status_returns_info(self):
+        """Test get_chase_status returns correct data."""
+        state = ChaseOrderState(
+            chase_id="abc123",
+            config=ChaseOrderConfig(
+                symbol="SOL/USDT:USDT",
+                side="buy",
+                amount=1.5,
+            ),
+            current_order_id="order-1",
+            initial_price=100.0,
+            current_price=100.2,
+            retry_count=3,
+        )
+        self.manager._active_chases["abc123"] = state
+        
+        status = self.manager.get_chase_status("abc123")
+        
+        assert status["chase_id"] == "abc123"
+        assert status["symbol"] == "SOL/USDT:USDT"
+        assert status["side"] == "buy"
+        assert status["amount"] == 1.5
+        assert status["status"] == "active"
         assert status["retry_count"] == 3
     
+    def test_get_chase_status_not_found(self):
+        """Test get_chase_status returns None for unknown ID."""
+        status = self.manager.get_chase_status("unknown")
+        assert status is None
+    
+    def test_get_prices_returns_cached(self):
+        """Test get_prices returns cached prices."""
+        self.manager._prices["SOL/USDT:USDT"] = {
+            "bid1": 100.0,
+            "ask1": 100.5,
+        }
+        
+        prices = self.manager.get_prices("SOL/USDT:USDT")
+        
+        assert prices["bid1"] == 100.0
+        assert prices["ask1"] == 100.5
+    
+    def test_get_prices_not_found(self):
+        """Test get_prices returns None for unknown symbol."""
+        prices = self.manager.get_prices("UNKNOWN")
+        assert prices is None
+
+
+class TestSubmitWithoutWarmup:
+    """Test submit_chase fails without warmup."""
+    
+    def teardown_method(self):
+        ChaseOrderManager.reset_instance()
+    
     @pytest.mark.asyncio
-    async def test_max_distance_stops_chase(self):
-        """Test chase stops when max distance reached."""
+    async def test_submit_chase_requires_warmup(self):
+        """Test submit_chase fails without warmup."""
+        exchange = MagicMock()
+        manager = ChaseOrderManager(exchange)
+        
         config = ChaseOrderConfig(
             symbol="SOL/USDT:USDT",
             side="buy",
             amount=1.0,
-            chase_mode="bid1",
-            max_chase_distance=0.3,  # Stop if moves $0.30
-            max_retries=100,
         )
         
-        chase_id = await self.manager.start_chase(config)
-        
-        # Wait for chase to complete
-        for _ in range(20):
-            await asyncio.sleep(0.1)
-            status = self.manager.get_chase_status(chase_id)
-            if status["status"] != "active":
-                break
-        
-        status = self.manager.get_chase_status(chase_id)
-        # Should stop due to distance (prices move $1.0 total)
-        assert status["status"] == "stopped"
+        with pytest.raises(RuntimeError, match="not warmed up"):
+            await manager.submit_chase(config)
 
 
 if __name__ == "__main__":

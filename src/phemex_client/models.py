@@ -202,10 +202,13 @@ class ChaseOrderConfig:
     amount: float                    # Order size in contracts
     
     # Chase mode: where to place the order relative to orderbook
-    # 'bid1' = at best bid (for buys wanting to be top of book)
-    # 'ask1' = at best ask (for sells wanting to be top of book)
+    # 'bid1' = at best bid (top of book)
+    # 'bid2' = at second best bid (one tick back, default for buys)
+    # 'ask1' = at best ask (top of book)
+    # 'ask2' = at second best ask (one tick back, default for sells)
     # 'distance' = at fixed distance from bid1 (buys) or ask1 (sells)
-    chase_mode: str = "bid1"
+    # Default (empty): bid2 for buys, ask2 for sells
+    chase_mode: str = ""
     
     # Distance from bid1/ask1 in price units (only used in 'distance' mode)
     # Positive = further from mid (e.g., bid1 - distance for buys)
@@ -220,6 +223,12 @@ class ChaseOrderConfig:
     
     # If True, order can only reduce position (closing orders)
     reduce_only: bool = False
+    
+    # Position side for hedge mode accounts: 'long', 'short', or None
+    # - Set to 'long' when opening/managing a long position
+    # - Set to 'short' when opening/managing a short position
+    # - Leave as None for one-way mode accounts
+    position_side: Optional[str] = None
 
 
 @dataclass
