@@ -1,5 +1,5 @@
 # src/phemex_client/chase_order_manager.py
-# Singleton manager for chase limit orders with real-time bid1/ask1 streaming
+# Singleton manager for chase limit orders using bid1/ask1 (top of book)
 # Establishes WS connection on warmup, receives commands via async queue
 # RELEVANT FILES: exchange_client.py, models.py, config.py, websocket_manager.py
 
@@ -487,8 +487,8 @@ class ChaseOrderManager:
             else:
                 price = ask1 + config.price_distance
         else:
-            # Default: bid2 for buys, ask2 for sells (one tick back)
-            price = bid2 if config.side == "buy" else ask2
+            # Default: bid1 for buys, ask1 for sells (top of book, aggressive)
+            price = bid1 if config.side == "buy" else ask1
         
         # Spread protection: ensure we never cross the spread
         if config.side == "buy":
@@ -668,11 +668,15 @@ class ChaseOrderManager:
                 state.retry_count += 1
                 
                 if result.status in ("rejected", "canceled", "expired"):
+                    # Post-only rejection: price would cross spread
+                    # Wait briefly and let the loop retry with fresh price
                     logger.warning(
-                        f"[{chase_id}] Order was {result.status} immediately. "
-                        f"Price {target_price} may have crossed spread."
+                        f"[{chase_id}] Post-only rejected: {result.status}. "
+                        f"Price {target_price} crossed spread. Will retry."
                     )
                     state.current_order_id = None
+                    state.retry_count += 1
+                    await asyncio.sleep(0.2)  # Brief backoff before retry
                     return
                 
                 if result.status in ("closed", "filled") and result.filled > 0:
