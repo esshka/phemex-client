@@ -120,7 +120,18 @@ async def main() -> None:
     
     try:
         await position_manager.load_initial_positions()
-        logger.info(f"Loaded {len(position_manager.positions)} existing positions")
+        
+        # Log summary and details for each position
+        pos_count = len(position_manager.positions)
+        if pos_count == 0:
+            logger.info("No existing positions found")
+        else:
+            logger.info(f"Loaded {pos_count} existing position(s) [READ-ONLY]:")
+            for pos in position_manager.get_all_positions():
+                logger.info(
+                    f"  → {pos.symbol}: {pos.side.upper()} "
+                    f"{pos.contracts:.4f} @ {pos.entry_price:.4f}"
+                )
         
     except Exception as e:
         logger.error(f"Failed to load positions: {e}")

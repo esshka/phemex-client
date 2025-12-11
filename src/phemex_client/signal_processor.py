@@ -28,6 +28,34 @@ from phemex_client.models import PositionState, Direction, ChaseOrderConfig
 logger = logging.getLogger(__name__)
 
 
+def normalize_symbol_for_phemex(symbol: str) -> str:
+    """
+    Convert ZMQ symbol format to Phemex perpetual futures format.
+    
+    ZMQ format: SOL_USDT, BTC_USDT, ETH_USDT
+    Phemex format: SOL/USDT:USDT, BTC/USDT:USDT, ETH/USDT:USDT
+    
+    Args:
+        symbol: Symbol in ZMQ format (underscore-separated)
+    
+    Returns:
+        Symbol in Phemex perpetual futures format
+    """
+    # If already in correct format, return as-is
+    if "/" in symbol and ":" in symbol:
+        return symbol
+    
+    # Convert underscore to slash and add :USDT suffix for perpetuals
+    # Example: SOL_USDT -> SOL/USDT:USDT
+    symbol = symbol.replace("_", "/")
+    
+    # Add :USDT suffix if not present (for perpetual futures)
+    if ":" not in symbol:
+        symbol = f"{symbol}:USDT"
+    
+    return symbol
+
+
 class SignalProcessor:
     """
     Processes trading signals from ZMQ.
@@ -131,7 +159,9 @@ class SignalProcessor:
         Args:
             message: ENTRY signal data
         """
-        symbol = message["symbol"]
+        # Normalize symbol from ZMQ format to Phemex format
+        # Example: SOL_USDT -> SOL/USDT:USDT
+        symbol = normalize_symbol_for_phemex(message["symbol"])
         direction = message["direction"].upper()
         price = float(message["price"])
         stop_loss = message.get("stop_loss")
@@ -145,32 +175,15 @@ class SignalProcessor:
         
         current_pos = self.positions.get_position(symbol)
         
-        # Check if already have position in same direction
+        # If any position exists for this symbol, ignore ENTRY signal
+        # This prevents duplicate entries and respects read-only positions
         if current_pos:
-            is_same_direction = (
-                (current_pos.side == "long" and direction == "LONG") or
-                (current_pos.side == "short" and direction == "SHORT")
+            read_only_tag = " [READ-ONLY]" if current_pos.is_read_only else ""
+            logger.info(
+                f"Ignoring ENTRY {direction} - position already exists: "
+                f"{current_pos.side} {current_pos.contracts:.4f}{read_only_tag}"
             )
-            
-            if is_same_direction:
-                logger.info(
-                    f"Ignoring {direction} - already have "
-                    f"{current_pos.side} position"
-                )
-                return
-            
-            # Opposite position exists - close it first
-            if current_pos.is_read_only:
-                logger.warning(
-                    f"Cannot close {symbol} - READ-ONLY position"
-                )
-                return
-            
-            logger.info(f"Closing opposite {current_pos.side} position first")
-            await self._close_position(current_pos, price)
-            
-            # Brief delay after close for position to clear
-            await asyncio.sleep(0.5)
+            return
         
         # Calculate position size
         contracts = self.calculate_position_size(
@@ -270,7 +283,8 @@ class SignalProcessor:
         Args:
             message: EXIT signal data
         """
-        symbol = message["symbol"]
+        # Normalize symbol from ZMQ format to Phemex format
+        symbol = normalize_symbol_for_phemex(message["symbol"])
         direction = message["direction"].upper()
         price = float(message["price"])
         reason = message.get("reason", "Signal")
@@ -315,7 +329,8 @@ class SignalProcessor:
         Args:
             message: PARTIAL_EXIT signal data
         """
-        symbol = message["symbol"]
+        # Normalize symbol from ZMQ format to Phemex format
+        symbol = normalize_symbol_for_phemex(message["symbol"])
         direction = message["direction"].upper()
         price = float(message["price"])
         exit_pct = float(message.get("exit_pct", 0.5))

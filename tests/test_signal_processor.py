@@ -18,8 +18,29 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from phemex_client.signal_processor import SignalProcessor
+from phemex_client.signal_processor import SignalProcessor, normalize_symbol_for_phemex
 from phemex_client.models import PositionState, OrderResult
+
+
+class TestSymbolNormalization:
+    """Tests for symbol format conversion."""
+    
+    def test_zmq_format_to_phemex(self):
+        """Test converting ZMQ format (SOL_USDT) to Phemex format (SOL/USDT:USDT)."""
+        assert normalize_symbol_for_phemex("SOL_USDT") == "SOL/USDT:USDT"
+        assert normalize_symbol_for_phemex("BTC_USDT") == "BTC/USDT:USDT"
+        assert normalize_symbol_for_phemex("ETH_USDT") == "ETH/USDT:USDT"
+    
+    def test_already_normalized_remains_unchanged(self):
+        """Test that already normalized symbols are not modified."""
+        assert normalize_symbol_for_phemex("SOL/USDT:USDT") == "SOL/USDT:USDT"
+        assert normalize_symbol_for_phemex("BTC/USDT:USDT") == "BTC/USDT:USDT"
+    
+    def test_partial_normalization(self):
+        """Test symbols that are partially normalized."""
+        # Has slash but no :USDT suffix
+        assert normalize_symbol_for_phemex("SOL/USDT") == "SOL/USDT:USDT"
+        assert normalize_symbol_for_phemex("BTC/USDT") == "BTC/USDT:USDT"
 
 
 class TestPositionSizing:
@@ -161,6 +182,33 @@ class TestEntrySignal:
         self.exchange.place_stop_loss_market.assert_called_once()
     
     @pytest.mark.asyncio
+    async def test_entry_with_zmq_symbol_format(self):
+        """Test ENTRY with ZMQ format symbol (SOL_USDT) gets normalized to Phemex format."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "SOL_USDT",  # ZMQ format (underscore)
+            "price": 130.0,
+            "stop_loss": 128.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify the symbol was normalized to Phemex format
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
+        
+        # Should be converted to SOL/USDT:USDT
+        assert config.symbol == "SOL/USDT:USDT"
+        assert config.side == "buy"
+        
+        # Verify stop-loss also uses normalized symbol
+        sl_kwargs = self.exchange.place_stop_loss_market.call_args.kwargs
+        assert sl_kwargs["symbol"] == "SOL/USDT:USDT"
+    
+    @pytest.mark.asyncio
     async def test_entry_short_no_position(self):
         """Test ENTRY SHORT with no existing position."""
         message = {
@@ -210,8 +258,13 @@ class TestEntrySignal:
         self.chase_manager.submit_chase_and_wait.assert_not_called()
     
     @pytest.mark.asyncio
-    async def test_entry_closes_opposite_position(self):
-        """Test ENTRY closes opposite position first."""
+    async def test_entry_ignored_when_opposite_position_exists(self):
+        """Test ENTRY ignored when opposite position exists.
+        
+        Changed behavior: ENTRY signals are now ignored when ANY position
+        exists for the symbol. This prevents opening new positions while
+        one is already active (use EXIT first, then new ENTRY).
+        """
         # Mock existing short position
         self.position_manager.get_position.return_value = PositionState(
             symbol="BTC/USDT:USDT",
@@ -232,11 +285,8 @@ class TestEntrySignal:
         
         await self.processor.process_signal(message)
         
-        # Verify cancel and close orders called
-        self.exchange.cancel_all_orders.assert_called()
-        
-        # Should have 2 calls: close + new entry
-        assert self.chase_manager.submit_chase_and_wait.call_count == 2
+        # Verify no orders placed - entry is ignored when position exists
+        self.chase_manager.submit_chase_and_wait.assert_not_called()
 
 
 class TestExitSignal:

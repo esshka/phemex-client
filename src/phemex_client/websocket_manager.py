@@ -154,12 +154,20 @@ class WebsocketManager:
         return self._order_updates.get(order_id)
         
     async def _stream_orderbook(self, symbol: str) -> None:
-        """Stream orderbook updates."""
+        """Stream orderbook updates with auto-reconnect."""
         logger.debug(f"Starting orderbook stream for {symbol}")
+        retry_delay = 1.0  # Start with 1s delay
+        max_delay = 8.0
+        
         try:
             while self._running:
                 try:
                     orderbook = await self._client.watch_order_book(symbol)
+                    
+                    # Reset retry delay on success
+                    if retry_delay > 1.0:
+                        logger.info(f"Orderbook stream reconnected for {symbol}")
+                        retry_delay = 1.0
                     
                     if orderbook["bids"] and orderbook["asks"]:
                         self._prices[symbol] = {
@@ -171,19 +179,32 @@ class WebsocketManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"Orderbook stream error for {symbol}: {e}")
-                    await asyncio.sleep(1.0)
+                    logger.warning(
+                        f"Orderbook stream disconnected for {symbol}: {e}. "
+                        f"Reconnecting in {retry_delay:.0f}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    # Exponential backoff
+                    retry_delay = min(retry_delay * 2, max_delay)
         except asyncio.CancelledError:
             pass
         logger.debug(f"Orderbook stream stopped for {symbol}")
 
     async def _stream_orders(self, symbol: str) -> None:
-        """Stream order updates."""
+        """Stream order updates with auto-reconnect."""
         logger.info(f"Starting order stream for {symbol}")
+        retry_delay = 1.0  # Start with 1s delay
+        max_delay = 8.0
+        
         try:
             while self._running:
                 try:
                     orders = await self._client.watch_orders(symbol)
+                    
+                    # Reset retry delay on success
+                    if retry_delay > 1.0:
+                        logger.info(f"Order stream reconnected for {symbol}")
+                        retry_delay = 1.0
                     
                     for order in orders:
                         order_id = order.get("id")
@@ -205,8 +226,13 @@ class WebsocketManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"Order stream error for {symbol}: {e}")
-                    await asyncio.sleep(1.0)
+                    logger.warning(
+                        f"Order stream disconnected for {symbol}: {e}. "
+                        f"Reconnecting in {retry_delay:.0f}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    # Exponential backoff
+                    retry_delay = min(retry_delay * 2, max_delay)
         except asyncio.CancelledError:
             pass
         logger.info(f"Order stream stopped for {symbol}")
