@@ -163,7 +163,8 @@ class SignalProcessor:
         elif action == "EXIT":
             await self._handle_exit(message)
         elif action == "PARTIAL_EXIT":
-            await self._handle_partial_exit(message)
+            # Filtered out - TPs are handled via limit orders placed after entry
+            logger.debug(f"Ignoring PARTIAL_EXIT signal (TPs use limit orders)")
         else:
             logger.warning(f"Unknown action: {action}")
     
@@ -172,10 +173,9 @@ class SignalProcessor:
         Process ENTRY signal.
         
         Flow:
-        1. Check for existing position (same direction = ignore)
-        2. If opposite position exists, close it first
-        3. Place new entry order (limit post-only)
-        4. Place stop-loss (market conditional)
+        1. Check for existing position (ignore if exists)
+        2. Place market entry order with SL attached
+        3. After fill, place limit close orders for each TP level
         
         Args:
             message: ENTRY signal data
@@ -186,12 +186,16 @@ class SignalProcessor:
         direction = message["direction"].upper()
         price = float(message["price"])
         stop_loss = message.get("stop_loss")
-        take_profit = message.get("take_profit")
         position_size_r = float(message.get("position_size_r", 1.0))
+        
+        # TP levels for limit close orders (placed after entry fills)
+        tp_levels = message.get("tp_levels", [])
+        multi_tp_enabled = message.get("multi_tp_enabled", False)
         
         logger.info(
             f"Processing ENTRY: {direction} {symbol} @ {price}, "
-            f"SL={stop_loss}, size_r={position_size_r}"
+            f"SL={stop_loss}, size_r={position_size_r}, "
+            f"tp_levels={len(tp_levels) if multi_tp_enabled else 0}"
         )
         
         current_pos = self.positions.get_position(symbol)
@@ -222,7 +226,7 @@ class SignalProcessor:
         side = "buy" if direction == "LONG" else "sell"
         
         try:
-            # Place entry order based on configured strategy
+            # Place entry order with SL only (no conditional TP)
             # position_side is required for hedge mode accounts
             position_side = "long" if direction == "LONG" else "short"
             
@@ -234,7 +238,7 @@ class SignalProcessor:
                 reduce_only=False,
                 is_entry=True,
                 stop_loss=stop_loss,
-                take_profit=take_profit,
+                # Note: No take_profit here - we use limit orders instead
             )
             
             if not fill_result:
@@ -245,13 +249,20 @@ class SignalProcessor:
             # Mark position as managed (not read-only) so we can close it later
             self.positions.mark_as_managed(symbol)
             
-            # Mark position as managed (not read-only) so we can close it later
-            self.positions.mark_as_managed(symbol)
+            # Place limit TP orders if tp_levels provided
+            if tp_levels and multi_tp_enabled:
+                await self._place_limit_tp_orders(
+                    symbol=symbol,
+                    direction=direction,
+                    total_contracts=filled_amount,
+                    tp_levels=tp_levels,
+                )
             
         except TimeoutError:
             logger.error(f"Entry chase timed out for {symbol}")
         except Exception as e:
             logger.error(f"Entry order failed: {e}")
+
     
     async def _handle_exit(self, message: dict) -> None:
         """
@@ -377,14 +388,14 @@ class SignalProcessor:
         price: float,
     ) -> None:
         """
-        Close entire position with chase order.
+        Close entire position with market order.
         
-        Cancels existing orders first (including SL/TP).
-        Uses chase order to ensure fill.
+        Cancels existing orders first (including SL/TP limit orders).
+        Always uses market order for immediate fill.
         
         Args:
             position: Position to close
-            price: Target price (used for logging, chase follows market)
+            price: Target price (for logging only, uses market)
         """
         # Cancel existing orders first (including SL/TP)
         await self.exchange.cancel_all_orders(position.symbol)
@@ -396,26 +407,37 @@ class SignalProcessor:
         position_side = position.side.lower()
         
         try:
-            fill_result = await self._place_order(
-                symbol=position.symbol,
-                side=side,
-                amount=position.contracts,
-                position_side=position_side,
-                reduce_only=True
+            # Always use market order for EXIT (immediate fill)
+            step_size = self.exchange.get_amount_step_size(position.symbol)
+            safe_amount = truncate_to_step_size(position.contracts, step_size)
+            
+            params = {"reduceOnly": True}
+            if position_side:
+                params["posSide"] = position_side.capitalize()
+            
+            logger.info(
+                f"Closing position with MARKET order: {side.upper()} "
+                f"{safe_amount:.4f} {position.symbol}"
             )
             
-            if fill_result:
-                fill_price, filled_amount = fill_result
-                logger.info(
-                    f"Position closed: {filled_amount:.4f} @ {fill_price:.4f}"
-                )
+            order = await self.exchange._create_order_with_retry(
+                symbol=position.symbol,
+                order_type="market",
+                side=side,
+                amount=safe_amount,
+                price=None,
+                params=params
+            )
+            
+            fill_price = order.get("average") or order.get("price") or 0.0
+            filled = order.get("filled") or safe_amount
+            
+            logger.info(f"Position closed: {filled:.4f} @ {fill_price:.4f}")
             
             # Immediately update local state
             # WebSocket will confirm, but this prevents duplicate signals
             self.positions.clear_position(position.symbol)
             
-        except TimeoutError:
-            logger.error(f"Close chase timed out for {position.symbol}")
         except Exception as e:
             logger.error(f"Close position failed: {e}")
     
@@ -459,6 +481,67 @@ class SignalProcessor:
             
         except Exception as e:
             logger.error(f"Move SL to BE failed: {e}")
+
+    async def _place_limit_tp_orders(
+        self,
+        symbol: str,
+        direction: str,
+        total_contracts: float,
+        tp_levels: list[dict],
+    ) -> None:
+        """
+        Place limit close orders for each TP level.
+        
+        Called after entry order fills. Places reduce-only limit orders
+        at each TP price to automatically close portions of the position.
+        
+        Args:
+            symbol: Trading symbol (Phemex format)
+            direction: LONG or SHORT
+            total_contracts: Total position size (filled amount)
+            tp_levels: List of TP levels with 'price' and 'exit_pct'
+        """
+        # For LONG: close side is 'sell'
+        # For SHORT: close side is 'buy'
+        close_side = "sell" if direction == "LONG" else "buy"
+        position_side = "long" if direction == "LONG" else "short"
+        
+        for i, tp in enumerate(tp_levels):
+            tp_price = tp.get("price")
+            exit_pct = tp.get("exit_pct", 0.0)
+            
+            if not tp_price or exit_pct <= 0:
+                logger.warning(f"Skipping invalid TP level {i+1}: {tp}")
+                continue
+            
+            # Calculate amount for this TP level
+            tp_amount = total_contracts * exit_pct
+            
+            # Truncate to step size
+            step_size = self.exchange.get_amount_step_size(symbol)
+            tp_amount = truncate_to_step_size(tp_amount, step_size)
+            
+            if tp_amount <= 0:
+                logger.warning(f"TP{i+1} amount too small after truncation")
+                continue
+            
+            try:
+                order = await self.exchange.place_limit_post_only(
+                    symbol=symbol,
+                    side=close_side,
+                    amount=tp_amount,
+                    price=tp_price,
+                    reduce_only=True,
+                    position_side=position_side,
+                )
+                
+                logger.info(
+                    f"Placed TP{i+1} limit order: {close_side.upper()} "
+                    f"{tp_amount:.4f} @ {tp_price} (order_id={order.order_id})"
+                )
+                
+            except Exception as e:
+                logger.error(f"Failed to place TP{i+1} limit order: {e}")
 
     async def _place_order(
         self,
