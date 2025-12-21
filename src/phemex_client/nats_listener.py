@@ -1,13 +1,13 @@
-# src/phemex_client/zmq_listener.py
-# ZeroMQ subscriber for receiving trading signals
-# Connects to publisher, validates messages, and routes to signal processor
+# src/phemex_client/nats_listener.py
+# NATS subscriber for receiving trading signals
+# Connects to NATS server, validates messages, and routes to signal processor
 # RELEVANT FILES: signal_processor.py, models.py, config.py
 
 """
-ZMQ listener for trading signals.
+NATS listener for trading signals.
 
 Features:
-- Subscribe to ZMQ publisher with topic filtering
+- Subscribe to NATS subject with async message handling
 - Parse and validate JSON messages
 - Route valid signals to signal processor
 - Graceful shutdown handling
@@ -17,18 +17,17 @@ import asyncio
 import json
 import logging
 
-import zmq
-import zmq.asyncio
+from nats.aio.client import Client as NATS
 
 
 logger = logging.getLogger(__name__)
 
 
-class ZmqListener:
+class NatsListener:
     """
-    ZMQ subscriber for trading signals.
+    NATS subscriber for trading signals.
     
-    Connects to a publisher and routes messages to the signal processor.
+    Connects to a NATS server and routes messages to the signal processor.
     """
     
     # Required fields for all messages
@@ -43,90 +42,65 @@ class ZmqListener:
     def __init__(
         self,
         signal_processor,
-        host: str = "127.0.0.1",
-        port: int = 5555,
-        topic: str = "orders",
+        url: str = "nats://localhost:4222",
+        subject: str = "orders",
     ):
         """
-        Initialize ZMQ listener.
+        Initialize NATS listener.
         
         Args:
             signal_processor: SignalProcessor instance
-            host: ZMQ publisher host
-            port: ZMQ publisher port
-            topic: ZMQ topic to subscribe to
+            url: NATS server URL (e.g., nats://localhost:4222)
+            subject: NATS subject to subscribe to
         """
         self.processor = signal_processor
-        self.host = host
-        self.port = port
-        self.topic = topic
+        self.url = url
+        self.subject = subject
         self._running = False
-        self._context = None
-        self._socket = None
+        self._nc = NATS()
+        self._sub = None
     
     async def start(self) -> None:
         """
-        Start listening for ZMQ messages.
+        Start listening for NATS messages.
         
         Runs until stop() is called or cancelled.
         """
-        self._context = zmq.asyncio.Context()
-        self._socket = self._context.socket(zmq.SUB)
+        await self._nc.connect(self.url)
+        logger.info(f"Connected to NATS at {self.url}")
         
-        address = f"tcp://{self.host}:{self.port}"
-        self._socket.connect(address)
-        self._socket.subscribe(self.topic.encode())
+        # Subscribe to subject with callback
+        self._sub = await self._nc.subscribe(self.subject, cb=self._handle_message)
         
         logger.info(
-            f"Listening for ZMQ messages on {address} (topic: {self.topic})"
+            f"Listening for NATS messages on subject '{self.subject}'"
         )
         self._running = True
         
         try:
+            # Keep running until stopped
             while self._running:
-                await self._receive_and_process()
+                await asyncio.sleep(1)
                 
         except asyncio.CancelledError:
-            logger.info("ZMQ listener cancelled")
+            logger.info("NATS listener cancelled")
             
         finally:
-            self._cleanup()
+            await self._cleanup()
     
-    async def _receive_and_process(self) -> None:
+    async def _handle_message(self, msg) -> None:
         """
-        Receive and process a single message.
-        
-        Handles multipart messages in format: [topic, payload]
-        """
-        try:
-            # Use timeout to allow periodic running check
-            if self._socket.poll(1000, zmq.POLLIN):
-                msg = await self._socket.recv_multipart()
-                await self._handle_message(msg)
-                
-        except zmq.ZMQError as e:
-            logger.error(f"ZMQ error: {e}")
-            await asyncio.sleep(0.1)
-    
-    async def _handle_message(self, msg: list[bytes]) -> None:
-        """
-        Handle a received multipart message.
+        Handle a received NATS message.
         
         Args:
-            msg: Multipart message [topic, payload, ...]
+            msg: NATS message object with 'data' attribute
         """
-        if len(msg) < 2:
-            logger.warning(f"Invalid message format: expected 2+ parts, got {len(msg)}")
-            return
-        
-        topic_str = msg[0].decode()
-        payload_str = msg[1].decode()
-        
         try:
+            payload_str = msg.data.decode()
             message = json.loads(payload_str)
             action = message.get("action", "ENTRY")
             
-            logger.info(f"Received {action} signal on topic '{topic_str}'")
+            logger.info(f"Received {action} signal on subject '{msg.subject}'")
             logger.debug(f"Message payload: {payload_str[:200]}")
             
             # Validate message
@@ -138,7 +112,7 @@ class ZmqListener:
             await self.processor.process_signal(message)
             
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parse error: {e}, payload: {payload_str[:100]}")
+            logger.error(f"JSON parse error: {e}, payload: {msg.data.decode()[:100]}")
     
     def _validate_message(self, message: dict) -> bool:
         """
@@ -180,19 +154,19 @@ class ZmqListener:
         
         return True
     
-    def _cleanup(self) -> None:
-        """Clean up ZMQ resources."""
-        if self._socket:
-            self._socket.close()
-            self._socket = None
+    async def _cleanup(self) -> None:
+        """Clean up NATS resources."""
+        if self._sub:
+            await self._sub.unsubscribe()
+            self._sub = None
         
-        if self._context:
-            self._context.term()
-            self._context = None
+        if self._nc.is_connected:
+            await self._nc.drain()
+            await self._nc.close()
         
-        logger.debug("ZMQ listener cleaned up")
+        logger.debug("NATS listener cleaned up")
     
     def stop(self) -> None:
         """Stop the listener."""
         self._running = False
-        logger.info("ZMQ listener stopping...")
+        logger.info("NATS listener stopping...")

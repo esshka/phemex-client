@@ -48,7 +48,8 @@ class ChaseOrderManager:
     MIN_PRICE_CHANGE_PCT = 0.0001  # 0.01%
     
     # Minimum interval between amends (seconds)
-    MIN_AMEND_INTERVAL = 1.0
+    # Reduced to 0.2s for faster reaction (Phemex allows ~10 req/s typically)
+    MIN_AMEND_INTERVAL = 0.2
     
     @classmethod
     def get_instance(cls, exchange_client: PhemexClient, ws_manager: Optional[WebsocketManager] = None) -> "ChaseOrderManager":
@@ -387,8 +388,8 @@ class ChaseOrderManager:
                         logger.info(f"[{chase_id}] Filled immediately!")
                         break
                 
-                # Chase interval: 1 second between checks
-                await asyncio.sleep(1.0)
+                # Chase interval: much faster polling for responsiveness
+                await asyncio.sleep(0.1)
                 
         except asyncio.CancelledError:
             logger.debug(f"[{chase_id}] Chase task canceled")
@@ -541,6 +542,10 @@ class ChaseOrderManager:
                     amount=remaining,
                     price=target_price,
                     position_side=config.position_side,
+                    stop_loss=config.stop_loss,
+                    take_profit=config.take_profit,
+                    sl_trigger=config.sl_trigger,
+                    tp_trigger=config.tp_trigger,
                 )
                 
                 state.current_price = target_price
@@ -659,6 +664,10 @@ class ChaseOrderManager:
                     price=target_price,
                     reduce_only=config.reduce_only,
                     position_side=config.position_side,
+                    stop_loss=config.stop_loss,
+                    take_profit=config.take_profit,
+                    sl_trigger=config.sl_trigger,
+                    tp_trigger=config.tp_trigger,
                 )
                 
                 state.current_order_id = result.order_id

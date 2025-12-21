@@ -4,7 +4,7 @@
 # RELEVANT FILES: exchange_client.py, position_manager.py, chase_order_manager.py
 
 """
-Signal processor for trading signals from ZMQ.
+Signal processor for trading signals from NATS.
 
 Handles:
 - ENTRY: Open new positions with chase orders (follows bid/ask for fill)
@@ -30,13 +30,13 @@ logger = logging.getLogger(__name__)
 
 def normalize_symbol_for_phemex(symbol: str) -> str:
     """
-    Convert ZMQ symbol format to Phemex perpetual futures format.
+    Convert signal symbol format to Phemex perpetual futures format.
     
-    ZMQ format: SOL_USDT, BTC_USDT, ETH_USDT
+    Signal format: SOL_USDT, BTC_USDT, ETH_USDT
     Phemex format: SOL/USDT:USDT, BTC/USDT:USDT, ETH/USDT:USDT
     
     Args:
-        symbol: Symbol in ZMQ format (underscore-separated)
+        symbol: Symbol in signal format (underscore-separated)
     
     Returns:
         Symbol in Phemex perpetual futures format
@@ -58,7 +58,7 @@ def normalize_symbol_for_phemex(symbol: str) -> str:
 
 class SignalProcessor:
     """
-    Processes trading signals from ZMQ.
+    Processes trading signals from NATS.
     
     Converts signals into appropriate order placements.
     Manages position lifecycle from entry to exit.
@@ -72,6 +72,9 @@ class SignalProcessor:
         deposit_size: float = 1000.0,
         r_percentage: float = 0.01,
         leverage: int = 20,
+        use_chase_orders: bool = False,
+        chase_mode: str = "bid2",
+        max_chase_retries: int = 50,
     ):
         """
         Initialize signal processor.
@@ -83,6 +86,9 @@ class SignalProcessor:
             deposit_size: Total deposit in USDT
             r_percentage: Risk percentage per R unit (e.g. 0.01 = 1%)
             leverage: Default leverage multiplier
+            use_chase_orders: If True, use chase orders. If False, use market in.
+            chase_mode: Strategy for chase orders (bid1, bid2, etc)
+            max_chase_retries: Max retries for chase orders
         """
         self.exchange = exchange_client
         self.positions = position_manager
@@ -90,9 +96,13 @@ class SignalProcessor:
         self.deposit_size = deposit_size
         self.r_percentage = r_percentage
         self.leverage = leverage
+        self.use_chase_orders = use_chase_orders
+        self.chase_mode = chase_mode
+        self.max_chase_retries = max_chase_retries
     
     def calculate_position_size(
         self,
+        symbol: str,
         entry_price: float,
         stop_loss: Optional[float],
         position_size_r: float,
@@ -104,6 +114,7 @@ class SignalProcessor:
         Target Notional = position_size_r * R Value
         
         Args:
+            symbol: Trading symbol (needed for step size lookup)
             entry_price: Entry price
             stop_loss: Stop-loss price (used for risk calc, not sizing here)
             position_size_r: Position size in R units
@@ -125,15 +136,25 @@ class SignalProcessor:
         # Note: Phemex uses the asset as contract unit, not USD
         contracts = target_notional / entry_price
         
-        # Round to reasonable precision
-        return truncate_to_step_size(contracts)
+        # Get the correct step size for this symbol (e.g., SOL=0.01, AAVE=0.1)
+        step_size = self.exchange.get_amount_step_size(symbol)
+        truncated = truncate_to_step_size(contracts, step_size)
+        
+        logger.info(
+            f"Position sizing: r_value={r_value:.2f}, "
+            f"target_notional={target_notional:.2f}, "
+            f"raw_contracts={contracts:.6f}, step_size={step_size}, "
+            f"truncated={truncated:.6f}"
+        )
+        
+        return truncated
     
     async def process_signal(self, message: dict) -> None:
         """
         Route signal to appropriate handler.
         
         Args:
-            message: Parsed ZMQ message dictionary
+            message: Parsed signal message dictionary
         """
         action = message.get("action", "ENTRY").upper()
         
@@ -159,7 +180,7 @@ class SignalProcessor:
         Args:
             message: ENTRY signal data
         """
-        # Normalize symbol from ZMQ format to Phemex format
+        # Normalize symbol from signal format to Phemex format
         # Example: SOL_USDT -> SOL/USDT:USDT
         symbol = normalize_symbol_for_phemex(message["symbol"])
         direction = message["direction"].upper()
@@ -187,6 +208,7 @@ class SignalProcessor:
         
         # Calculate position size
         contracts = self.calculate_position_size(
+            symbol=symbol,
             entry_price=price,
             stop_loss=stop_loss,
             position_size_r=position_size_r,
@@ -200,71 +222,28 @@ class SignalProcessor:
         side = "buy" if direction == "LONG" else "sell"
         
         try:
-            # Place entry order using chase (follows bid/ask for fill)
+            # Place entry order based on configured strategy
             # position_side is required for hedge mode accounts
             position_side = "long" if direction == "LONG" else "short"
             
-            chase_config = ChaseOrderConfig(
+            fill_result = await self._place_order(
                 symbol=symbol,
                 side=side,
                 amount=contracts,
-                # Default chase mode: bid2 for buys, ask2 for sells (one tick back)
-                max_chase_distance=0,  # No distance limit for entries
-                max_retries=100,       # Generous retry limit
-                reduce_only=False,
                 position_side=position_side,
+                reduce_only=False,
+                is_entry=True,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
             
-            logger.info(
-                f"Submitting chase entry: {direction} {contracts:.4f} {symbol}"
-            )
-            
-            # Wait for chase to fill (up to 60s)
-            chase_state = await self.chase_manager.submit_chase_and_wait(
-                chase_config, timeout=60.0
-            )
-            
-            if chase_state.status != "filled":
-                logger.warning(
-                    f"Entry chase did not fill: {chase_state.status}, "
-                    f"filled={chase_state.total_filled:.4f}"
-                )
+            if not fill_result:
                 return
-            
-            # Entry filled - log the result
-            fill_price = chase_state.fill_price or price
-            filled_amount = chase_state.total_filled
-            
-            logger.info(
-                f"Entry filled: {direction} {filled_amount:.4f} @ {fill_price:.4f}"
-            )
-            
-            # Place stop-loss (market conditional) - SAFETY NET ONLY
-            # System sends EXIT signals for internal SL logic.
-            # Add 0.2% buffer to prevent premature triggers.
-            if stop_loss:
-                sl_side = "sell" if direction == "LONG" else "buy"
                 
-                # Apply 0.2% buffer: move SL slightly further from entry
-                # LONG: SL is below entry, so subtract 0.2%
-                # SHORT: SL is above entry, so add 0.2%
-                sl_buffer = 0.002  # 0.2%
-                if direction == "LONG":
-                    buffered_sl = stop_loss * (1 - sl_buffer)
-                else:
-                    buffered_sl = stop_loss * (1 + sl_buffer)
-                
-                sl_order = await self.exchange.place_stop_loss_market(
-                    symbol=symbol,
-                    side=sl_side,
-                    amount=filled_amount,  # Use actual filled amount
-                    trigger_price=buffered_sl,
-                )
-                
-                logger.info(
-                    f"Stop-loss placed: {sl_order.order_id} "
-                    f"trigger @ {buffered_sl:.4f} (buffered from {stop_loss})"
-                )
+            fill_price, filled_amount = fill_result
+            
+            # Mark position as managed (not read-only) so we can close it later
+            self.positions.mark_as_managed(symbol)
             
             # Mark position as managed (not read-only) so we can close it later
             self.positions.mark_as_managed(symbol)
@@ -283,7 +262,7 @@ class SignalProcessor:
         Args:
             message: EXIT signal data
         """
-        # Normalize symbol from ZMQ format to Phemex format
+        # Normalize symbol from signal format to Phemex format
         symbol = normalize_symbol_for_phemex(message["symbol"])
         direction = message["direction"].upper()
         price = float(message["price"])
@@ -329,7 +308,7 @@ class SignalProcessor:
         Args:
             message: PARTIAL_EXIT signal data
         """
-        # Normalize symbol from ZMQ format to Phemex format
+        # Normalize symbol from signal format to Phemex format
         symbol = normalize_symbol_for_phemex(message["symbol"])
         direction = message["direction"].upper()
         price = float(message["price"])
@@ -365,40 +344,22 @@ class SignalProcessor:
         side = "sell" if current_pos.side == "long" else "buy"
         
         try:
-            # Place partial close order using chase (follows bid/ask for fill)
+            # Place partial close order based on configured strategy
             # position_side: when closing a LONG, still 'long'; when closing SHORT, still 'short'
             position_side = current_pos.side.lower()
             
-            chase_config = ChaseOrderConfig(
+            fill_result = await self._place_order(
                 symbol=symbol,
                 side=side,
                 amount=close_contracts,
-                # Default chase mode: bid2 for buys, ask2 for sells
-                max_chase_distance=0,  # No distance limit for exits
-                max_retries=50,        # Lower limit for partial exits
-                reduce_only=True,
                 position_side=position_side,
+                reduce_only=True
             )
             
-            logger.info(
-                f"Submitting chase partial exit: {close_contracts:.4f} of "
-                f"{current_pos.contracts:.4f} {symbol}"
-            )
-            
-            # Wait for chase to fill (up to 30s for partial exits)
-            chase_state = await self.chase_manager.submit_chase_and_wait(
-                chase_config, timeout=30.0
-            )
-            
-            if chase_state.status != "filled":
-                logger.warning(
-                    f"Partial exit chase did not fill: {chase_state.status}, "
-                    f"filled={chase_state.total_filled:.4f}"
-                )
-            else:
+            if fill_result:
+                fill_price, filled_amount = fill_result
                 logger.info(
-                    f"Partial exit filled: {chase_state.total_filled:.4f} "
-                    f"@ {chase_state.fill_price:.4f}"
+                    f"Partial exit filled: {filled_amount:.4f} @ {fill_price:.4f}"
                 )
             
             # Move SL to break-even if requested
@@ -435,35 +396,18 @@ class SignalProcessor:
         position_side = position.side.lower()
         
         try:
-            chase_config = ChaseOrderConfig(
+            fill_result = await self._place_order(
                 symbol=position.symbol,
                 side=side,
                 amount=position.contracts,
-                # Default chase mode: bid2 for buys, ask2 for sells
-                max_chase_distance=0,  # No distance limit for closes
-                max_retries=100,       # Generous retry limit for close
-                reduce_only=True,
                 position_side=position_side,
+                reduce_only=True
             )
             
-            logger.info(
-                f"Submitting chase close: {position.contracts:.4f} {position.symbol}"
-            )
-            
-            # Wait for chase to fill (up to 60s for closes)
-            chase_state = await self.chase_manager.submit_chase_and_wait(
-                chase_config, timeout=60.0
-            )
-            
-            if chase_state.status != "filled":
-                logger.warning(
-                    f"Close chase did not fill: {chase_state.status}, "
-                    f"filled={chase_state.total_filled:.4f}"
-                )
-            else:
+            if fill_result:
+                fill_price, filled_amount = fill_result
                 logger.info(
-                    f"Position closed: {chase_state.total_filled:.4f} "
-                    f"@ {chase_state.fill_price:.4f}"
+                    f"Position closed: {filled_amount:.4f} @ {fill_price:.4f}"
                 )
             
             # Immediately update local state
@@ -515,3 +459,116 @@ class SignalProcessor:
             
         except Exception as e:
             logger.error(f"Move SL to BE failed: {e}")
+
+    async def _place_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        position_side: str,
+        reduce_only: bool = False,
+        is_entry: bool = False,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> Optional[tuple[float, float]]:
+        """
+        Execute order using configured strategy (Market or Chase).
+        
+        Args:
+            symbol: Trading symbol
+            side: 'buy' or 'sell'
+            amount: Order amount
+            position_side: 'long' or 'short' (for hedge mode)
+            reduce_only: If True, reduce-only order
+            is_entry: If True, this is an entry order (different logging/timeouts)
+            
+        Returns:
+            Tuple (fill_price, filled_amount) if successful, None if failed
+        """
+        if self.use_chase_orders:
+            # --- CHASE LIMIT STRATEGY ---
+            timeout = 60.0 if not reduce_only else 30.0
+            
+            chase_config = ChaseOrderConfig(
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                chase_mode=self.chase_mode,
+                max_chase_distance=0,  # No distance monitoring for now
+                max_retries=self.max_chase_retries,
+                reduce_only=reduce_only,
+                position_side=position_side,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+            
+            logger.info(
+                f"Submitting CHASE {'entry' if is_entry else 'exit'}: "
+                f"{side.upper()} {amount:.4f} {symbol}"
+            )
+            
+            try:
+                chase_state = await self.chase_manager.submit_chase_and_wait(
+                    chase_config, timeout=timeout
+                )
+                
+                if chase_state.status != "filled":
+                    logger.warning(
+                        f"Chase did not fill: {chase_state.status}, "
+                        f"filled={chase_state.total_filled:.4f}"
+                    )
+                    return None
+                
+                logger.info(
+                    f"Chase filled: {chase_state.total_filled:.4f} @ "
+                    f"{chase_state.fill_price:.4f}"
+                )
+                return chase_state.fill_price, chase_state.total_filled
+                
+            except TimeoutError:
+                logger.error(f"Chase timed out for {symbol}")
+                return None
+        
+        else:
+            # --- MARKET ORDER STRATEGY ---
+            logger.info(
+                f"Placing MARKET {'entry' if is_entry else 'exit'}: "
+                f"{side.upper()} {amount:.4f} {symbol}"
+            )
+            
+            try:
+                # Need to use create_order directly for market orders
+                # Truncate amount first
+                step_size = self.exchange.get_amount_step_size(symbol)
+                safe_amount = truncate_to_step_size(amount, step_size)
+                
+                params = {"reduceOnly": reduce_only}
+                if position_side:
+                    params["posSide"] = position_side.capitalize()
+                
+                if stop_loss:
+                    params["stopLossRp"] = str(stop_loss)
+                    params["slTrigger"] = "ByMarkPrice"
+                if take_profit:
+                    params["takeProfitRp"] = str(take_profit)
+                    params["tpTrigger"] = "ByMarkPrice"
+                
+                order = await self.exchange._create_order_with_retry(
+                    symbol=symbol,
+                    order_type="market",
+                    side=side,
+                    amount=safe_amount,
+                    price=None,
+                    params=params
+                )
+                
+                # Market orders fill immediately usually, but we should parse result
+                fill_price = order.get("average") or order.get("price") or 0.0
+                filled = order.get("filled") or safe_amount
+                
+                logger.info(f"Market order filled: {filled:.4f} @ {fill_price:.4f}")
+                return float(fill_price), float(filled)
+                
+            except Exception as e:
+                logger.error(f"Market order execution failed: {e}")
+                return None

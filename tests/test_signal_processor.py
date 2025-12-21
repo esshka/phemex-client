@@ -49,6 +49,8 @@ class TestPositionSizing:
     def setup_method(self):
         """Set up test fixtures."""
         self.exchange = MagicMock()
+        # Mock the step size lookup to return 0.01 (like SOL)
+        self.exchange.get_amount_step_size = MagicMock(return_value=0.01)
         self.position_manager = MagicMock()
         
         self.chase_manager = MagicMock()
@@ -59,6 +61,7 @@ class TestPositionSizing:
             deposit_size=1000.0,
             r_percentage=0.01,  # 1% = 10 USDT per R
             leverage=20,
+            use_chase_orders=True,
         )
     
     def test_basic_position_size(self):
@@ -66,6 +69,7 @@ class TestPositionSizing:
         # 10 R = 100 USDT notional
         # At price 100, that's 1.0 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=100.0,
             stop_loss=99.0,
             position_size_r=10.0,
@@ -78,6 +82,7 @@ class TestPositionSizing:
         # 10 R = 100 USDT notional
         # At price 50, that's 2.0 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=50.0,
             stop_loss=49.0,
             position_size_r=10.0,
@@ -91,6 +96,7 @@ class TestPositionSizing:
         # Max is 1000 * 20 * 0.95 = 19000 USDT
         # At price 100, max is 190 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=100.0,
             stop_loss=99.0,
             position_size_r=2000.0,  # High enough to hit the cap
@@ -103,12 +109,30 @@ class TestPositionSizing:
         # 1 R = 10 USDT notional
         # At price 100, that's 0.1 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=100.0,
             stop_loss=99.0,
             position_size_r=1.0,
         )
         
         assert size == 0.1
+    
+    def test_position_size_with_different_step_size(self):
+        """Test position size with different step sizes (e.g., AAVE=0.1)."""
+        # Mock AAVE-like step size
+        self.exchange.get_amount_step_size.return_value = 0.1
+        
+        # 10 R = 100 USDT notional
+        # At price 100, raw = 1.0 contracts
+        # With step 0.1, still 1.0
+        size = self.processor.calculate_position_size(
+            symbol="AAVE/USDT:USDT",
+            entry_price=100.0,
+            stop_loss=99.0,
+            position_size_r=10.0,
+        )
+        
+        assert size == 1.0
 
 
 class TestEntrySignal:
@@ -137,6 +161,8 @@ class TestEntrySignal:
             )
         )
         self.exchange.cancel_all_orders = AsyncMock(return_value=[])
+        # Mock step size lookup for position sizing
+        self.exchange.get_amount_step_size = MagicMock(return_value=0.01)
         
         self.position_manager = MagicMock()
         self.position_manager.get_position = MagicMock(return_value=None)
@@ -153,6 +179,7 @@ class TestEntrySignal:
             deposit_size=1000.0,
             r_percentage=0.01,
             leverage=20,
+            use_chase_orders=True,
         )
     
     @pytest.mark.asyncio
@@ -177,9 +204,10 @@ class TestEntrySignal:
         
         assert config.symbol == "BTC/USDT:USDT"
         assert config.side == "buy"
+        assert config.stop_loss == 42500.0
         
-        # Verify stop-loss placed
-        self.exchange.place_stop_loss_market.assert_called_once()
+        # Verify stop-loss NOT placed as separate order
+        self.exchange.place_stop_loss_market.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_entry_with_zmq_symbol_format(self):
@@ -203,10 +231,10 @@ class TestEntrySignal:
         # Should be converted to SOL/USDT:USDT
         assert config.symbol == "SOL/USDT:USDT"
         assert config.side == "buy"
+        assert config.stop_loss == 128.0
         
-        # Verify stop-loss also uses normalized symbol
-        sl_kwargs = self.exchange.place_stop_loss_market.call_args.kwargs
-        assert sl_kwargs["symbol"] == "SOL/USDT:USDT"
+        # Verify separate stop-loss NOT called
+        self.exchange.place_stop_loss_market.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_entry_short_no_position(self):
@@ -228,10 +256,10 @@ class TestEntrySignal:
         self.chase_manager.submit_chase_and_wait.assert_called_once()
         config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
         assert config.side == "sell"
+        assert config.stop_loss == 43500.0
         
-        # Verify stop-loss side is buy (to close short)
-        sl_kwargs = self.exchange.place_stop_loss_market.call_args.kwargs
-        assert sl_kwargs["side"] == "buy"
+        # Verify separate stop-loss NOT called
+        self.exchange.place_stop_loss_market.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_entry_ignored_same_direction(self):
@@ -318,6 +346,7 @@ class TestExitSignal:
             exchange_client=self.exchange,
             position_manager=self.position_manager,
             chase_manager=self.chase_manager,
+            use_chase_orders=True,
         )
     
     @pytest.mark.asyncio
@@ -431,6 +460,7 @@ class TestPartialExitSignal:
             exchange_client=self.exchange,
             position_manager=self.position_manager,
             chase_manager=self.chase_manager,
+            use_chase_orders=True,
         )
     
     @pytest.mark.asyncio

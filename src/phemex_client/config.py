@@ -1,10 +1,10 @@
 # src/phemex_client/config.py
 # Configuration loader for the single config.yml file
-# Loads all settings: API credentials, ZMQ, position sizing, trading
+# Loads all settings: API credentials, NATS, position sizing, trading
 # RELEVANT FILES: __init__.py, models.py, exchange_client.py
 
 """
-Configuration module for Phemex ZMQ Order Listener.
+Configuration module for Phemex NATS Order Listener.
 
 Loads all settings from a single config.yml file.
 """
@@ -25,16 +25,10 @@ class PhemexConfig:
 
 
 @dataclass
-class ZmqConfig:
-    """ZeroMQ connection settings."""
-    host: str = "127.0.0.1"
-    port: int = 5555
-    topic: str = "orders"
-    
-    @property
-    def url(self) -> str:
-        """Get full ZMQ URL."""
-        return f"tcp://{self.host}:{self.port}"
+class NatsConfig:
+    """NATS connection settings."""
+    url: str = "nats://localhost:4222"
+    subject: str = "orders"
 
 
 @dataclass
@@ -57,6 +51,14 @@ class TradingConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    """Order execution settings."""
+    use_chase_orders: bool = False
+    chase_mode: str = "bid2"
+    max_chase_retries: int = 50
+
+
+@dataclass
 class Config:
     """
     Main configuration container.
@@ -64,9 +66,10 @@ class Config:
     Holds all settings from config.yml.
     """
     phemex: PhemexConfig = field(default_factory=PhemexConfig)
-    zmq: ZmqConfig = field(default_factory=ZmqConfig)
+    nats: NatsConfig = field(default_factory=NatsConfig)
     position_sizing: PositionSizingConfig = field(default_factory=PositionSizingConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
 
 def load_config(config_path: Optional[str] = None) -> Config:
@@ -104,12 +107,11 @@ def load_config(config_path: Optional[str] = None) -> Config:
         testnet=phemex_data.get("testnet", False),
     )
     
-    # Parse zmq section
-    zmq_data = data.get("zmq", {})
-    zmq = ZmqConfig(
-        host=zmq_data.get("host", "127.0.0.1"),
-        port=zmq_data.get("port", 5555),
-        topic=zmq_data.get("topic", "orders"),
+    # Parse nats section
+    nats_data = data.get("nats", {})
+    nats = NatsConfig(
+        url=nats_data.get("url", "nats://localhost:4222"),
+        subject=nats_data.get("subject", "orders"),
     )
     
     # Parse position_sizing section
@@ -126,9 +128,18 @@ def load_config(config_path: Optional[str] = None) -> Config:
         leverage=trading_data.get("leverage", 20),
     )
     
+    # Parse execution section
+    exec_data = data.get("execution", {})
+    execution = ExecutionConfig(
+        use_chase_orders=exec_data.get("use_chase_orders", False),
+        chase_mode=exec_data.get("chase_mode", "bid2"),
+        max_chase_retries=exec_data.get("max_chase_retries", 50),
+    )
+    
     return Config(
         phemex=phemex,
-        zmq=zmq,
+        nats=nats,
         position_sizing=position_sizing,
         trading=trading,
+        execution=execution,
     )

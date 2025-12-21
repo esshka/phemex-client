@@ -4,9 +4,9 @@
 # RELEVANT FILES: config.py, models.py, exchange_client.py, chase_order_manager.py
 
 """
-Phemex ZMQ Order Listener Package
+Phemex NATS Order Listener Package
 
-Listens for trading signals via ZeroMQ and executes trades on Phemex Futures.
+Listens for trading signals via NATS and executes trades on Phemex Futures.
 Uses limit post-only orders for entries/exits, market orders for stop-loss.
 """
 
@@ -14,12 +14,12 @@ from phemex_client.config import (
     Config,
     load_config,
     PhemexConfig,
-    ZmqConfig,
+    NatsConfig,
     PositionSizingConfig,
     TradingConfig,
 )
 from phemex_client.models import (
-    ZmqMessage,
+    SignalMessage,
     PositionState,
     OrderResult,
     ChaseOrderConfig,
@@ -28,7 +28,7 @@ from phemex_client.models import (
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.position_manager import PositionManager
 from phemex_client.signal_processor import SignalProcessor
-from phemex_client.zmq_listener import ZmqListener
+from phemex_client.nats_listener import NatsListener
 from phemex_client.chase_order_manager import ChaseOrderManager
 
 __version__ = "0.1.0"
@@ -37,16 +37,16 @@ __all__ = [
     "Config",
     "load_config",
     "PhemexConfig",
-    "ZmqConfig",
+    "NatsConfig",
     "PositionSizingConfig",
     "TradingConfig",
-    "ZmqMessage",
+    "SignalMessage",
     "PositionState",
     "OrderResult",
     "PhemexClient",
     "PositionManager",
     "SignalProcessor",
-    "ZmqListener",
+    "NatsListener",
     "ChaseOrderManager",
     "ChaseOrderConfig",
     "ChaseOrderState",
