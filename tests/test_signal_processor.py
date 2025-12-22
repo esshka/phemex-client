@@ -317,6 +317,172 @@ class TestEntrySignal:
         self.chase_manager.submit_chase_and_wait.assert_not_called()
 
 
+class TestMultiTpEntry:
+    """Tests for ENTRY signal with multi-TP functionality."""
+    
+    def setup_method(self):
+        """Set up test fixtures with async mocks."""
+        self.exchange = MagicMock()
+        self.exchange.place_limit_post_only = AsyncMock(
+            return_value=OrderResult(
+                order_id="tp-123",
+                symbol="BTC/USDT:USDT",
+                side="sell",
+                order_type="limit",
+                amount=0.05,
+                price=44000.0,
+            )
+        )
+        self.exchange.cancel_all_orders = AsyncMock(return_value=[])
+        self.exchange.get_amount_step_size = MagicMock(return_value=0.01)
+        
+        self.position_manager = MagicMock()
+        self.position_manager.get_position = MagicMock(return_value=None)
+        self.position_manager.mark_as_managed = MagicMock()
+        
+        self.chase_manager = MagicMock()
+        # Mock successful entry fill
+        self.chase_manager.submit_chase_and_wait = AsyncMock(
+            return_value=MagicMock(
+                status="filled",
+                total_filled=0.1,
+                fill_price=43000.0
+            )
+        )
+        
+        self.processor = SignalProcessor(
+            exchange_client=self.exchange,
+            position_manager=self.position_manager,
+            chase_manager=self.chase_manager,
+            deposit_size=1000.0,
+            r_percentage=0.01,
+            leverage=20,
+            use_chase_orders=True,
+        )
+    
+    @pytest.mark.asyncio
+    async def test_entry_with_multi_tp_places_limit_orders(self):
+        """Test ENTRY with multi_tp_enabled places limit close orders for each TP level."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 42500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": True,
+            "tp_levels": [
+                {"ratio": 1.2, "price": 43500.0, "exit_pct": 0.5},
+                {"ratio": 2.0, "price": 44000.0, "exit_pct": 0.3},
+                {"ratio": 3.0, "price": 44500.0, "exit_pct": 0.2},
+            ],
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        
+        # Verify position marked as managed
+        self.position_manager.mark_as_managed.assert_called_once_with("BTC/USDT:USDT")
+        
+        # Verify limit TP orders placed (3 calls)
+        assert self.exchange.place_limit_post_only.call_count == 3
+        
+        # Check each TP order
+        calls = self.exchange.place_limit_post_only.call_args_list
+        
+        # TP1: 50% at 43500
+        assert calls[0].kwargs["symbol"] == "BTC/USDT:USDT"
+        assert calls[0].kwargs["side"] == "sell"  # Closing LONG
+        assert calls[0].kwargs["price"] == 43500.0
+        assert abs(calls[0].kwargs["amount"] - 0.05) < 0.001  # 0.1 * 0.5
+        assert calls[0].kwargs["reduce_only"] is True
+        assert calls[0].kwargs["position_side"] == "long"
+        
+        # TP2: 30% at 44000
+        assert calls[1].kwargs["price"] == 44000.0
+        assert abs(calls[1].kwargs["amount"] - 0.03) < 0.001  # 0.1 * 0.3
+        
+        # TP3: 20% at 44500
+        assert calls[2].kwargs["price"] == 44500.0
+        assert abs(calls[2].kwargs["amount"] - 0.02) < 0.001  # 0.1 * 0.2
+    
+    @pytest.mark.asyncio
+    async def test_entry_short_with_multi_tp(self):
+        """Test SHORT entry with multi-TP uses correct order side (buy to close)."""
+        message = {
+            "action": "ENTRY",
+            "direction": "SHORT",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 43500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": True,
+            "tp_levels": [
+                {"ratio": 1.2, "price": 42500.0, "exit_pct": 0.5},
+                {"ratio": 2.0, "price": 42000.0, "exit_pct": 0.5},
+            ],
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify TP orders use BUY side (closing SHORT)
+        calls = self.exchange.place_limit_post_only.call_args_list
+        assert calls[0].kwargs["side"] == "buy"
+        assert calls[0].kwargs["position_side"] == "short"
+    
+    @pytest.mark.asyncio
+    async def test_entry_without_multi_tp_skips_limit_orders(self):
+        """Test ENTRY without multi_tp_enabled does NOT place limit TP orders."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 42500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": False,  # Disabled
+            "tp_levels": [
+                {"ratio": 1.2, "price": 43500.0, "exit_pct": 0.5},
+            ],
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        
+        # Verify NO limit TP orders placed
+        self.exchange.place_limit_post_only.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_entry_with_empty_tp_levels_skips_limit_orders(self):
+        """Test ENTRY with multi_tp_enabled but empty tp_levels skips limit orders."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 42500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": True,
+            "tp_levels": [],  # Empty
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        
+        # Verify NO limit TP orders placed
+        self.exchange.place_limit_post_only.assert_not_called()
+
+
 class TestExitSignal:
     """Tests for EXIT signal handling."""
     

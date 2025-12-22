@@ -195,7 +195,10 @@ class SignalProcessor:
         logger.info(
             f"Processing ENTRY: {direction} {symbol} @ {price}, "
             f"SL={stop_loss}, size_r={position_size_r}, "
-            f"tp_levels={len(tp_levels) if multi_tp_enabled else 0}"
+            f"multi_tp_enabled={multi_tp_enabled}, tp_levels={len(tp_levels)}"
+        )
+        logger.debug(
+            f"TP levels detail: {tp_levels}"
         )
         
         current_pos = self.positions.get_position(symbol)
@@ -250,12 +253,24 @@ class SignalProcessor:
             self.positions.mark_as_managed(symbol)
             
             # Place limit TP orders if tp_levels provided
+            logger.debug(
+                f"Checking multi-TP condition: tp_levels={bool(tp_levels)}, "
+                f"multi_tp_enabled={multi_tp_enabled}"
+            )
             if tp_levels and multi_tp_enabled:
+                logger.info(
+                    f"Placing {len(tp_levels)} limit TP orders for {symbol}"
+                )
                 await self._place_limit_tp_orders(
                     symbol=symbol,
                     direction=direction,
                     total_contracts=filled_amount,
                     tp_levels=tp_levels,
+                )
+            else:
+                logger.debug(
+                    f"Skipping multi-TP orders (tp_levels={len(tp_levels)}, "
+                    f"multi_tp_enabled={multi_tp_enabled})"
                 )
             
         except TimeoutError:
@@ -501,6 +516,11 @@ class SignalProcessor:
             total_contracts: Total position size (filled amount)
             tp_levels: List of TP levels with 'price' and 'exit_pct'
         """
+        logger.info(
+            f"_place_limit_tp_orders called: {symbol} {direction} "
+            f"total_contracts={total_contracts:.4f}, {len(tp_levels)} levels"
+        )
+        
         # For LONG: close side is 'sell'
         # For SHORT: close side is 'buy'
         close_side = "sell" if direction == "LONG" else "buy"
@@ -536,7 +556,7 @@ class SignalProcessor:
                 )
                 
                 logger.info(
-                    f"Placed TP{i+1} limit order: {close_side.upper()} "
+                    f"✓ Placed TP{i+1} limit order: {close_side.upper()} "
                     f"{tp_amount:.4f} @ {tp_price} (order_id={order.order_id})"
                 )
                 
