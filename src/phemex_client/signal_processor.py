@@ -539,10 +539,20 @@ class SignalProcessor:
             
             # Truncate to step size
             step_size = self.exchange.get_amount_step_size(symbol)
+            tp_amount_before = tp_amount
             tp_amount = truncate_to_step_size(tp_amount, step_size)
             
+            logger.info(
+                f"TP{i+1}: total={total_contracts:.8f}, pct={exit_pct:.2f}, "
+                f"raw={tp_amount_before:.8f}, step_size={step_size}, "
+                f"truncated={tp_amount:.8f}"
+            )
+            
             if tp_amount <= 0:
-                logger.warning(f"TP{i+1} amount too small after truncation")
+                logger.warning(
+                    f"TP{i+1} amount too small after truncation "
+                    f"(raw={tp_amount_before:.8f}, step={step_size}, final={tp_amount:.8f})"
+                )
                 continue
             
             try:
