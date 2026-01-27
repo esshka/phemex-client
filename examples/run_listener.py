@@ -1,14 +1,14 @@
 # examples/run_listener.py
-# Main entry point for the Phemex ZMQ Order Listener
-# Starts WebSocket watchers and ZMQ listener concurrently
-# RELEVANT FILES: config.py, exchange_client.py, zmq_listener.py, signal_processor.py
+# Main entry point for the Phemex NATS Order Listener
+# Starts WebSocket watchers and NATS listener concurrently
+# RELEVANT FILES: config.py, exchange_client.py, nats_listener.py, signal_processor.py
 
 """
-Phemex ZMQ Order Listener - Main Entry Point
+Phemex NATS Order Listener - Main Entry Point
 
-Listens for trading signals via ZMQ and executes on Phemex Futures.
-Uses limit post-only orders for entries/exits.
-Uses market orders for stop-loss only.
+Listens for trading signals via NATS and executes on Phemex Futures.
+Uses chase orders for entries/exits (follows bid/ask for guaranteed fills).
+Uses market orders for stop-loss only (safety net).
 
 Usage:
     poetry run python examples/run_listener.py
@@ -27,8 +27,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.position_manager import PositionManager
+from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.signal_processor import SignalProcessor
-from phemex_client.zmq_listener import ZmqListener
+from phemex_client.nats_listener import NatsListener
 
 
 # Configure logging
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Phemex ZMQ Order Listener"
+        description="Phemex NATS Order Listener"
     )
     parser.add_argument(
         "--config",
@@ -57,7 +59,7 @@ def parse_args():
 def print_startup_banner(config) -> None:
     """Print startup configuration banner."""
     logger.info("=" * 60)
-    logger.info("Phemex ZMQ Order Listener")
+    logger.info("Phemex NATS Order Listener")
     logger.info("=" * 60)
     logger.info(f"Testnet mode: {config.phemex.testnet}")
     logger.info(f"Symbols: {config.trading.symbols}")
@@ -65,7 +67,7 @@ def print_startup_banner(config) -> None:
     logger.info(f"Deposit: {config.position_sizing.deposit_size} USDT")
     logger.info(f"R Value: {config.position_sizing.r_value:.2f} USDT "
                 f"({config.position_sizing.r_percentage * 100}%)")
-    logger.info(f"ZMQ: {config.zmq.url} (topic: {config.zmq.topic})")
+    logger.info(f"NATS: {config.nats.url} (subject: {config.nats.subject})")
     logger.info("=" * 60)
 
 
@@ -101,6 +103,13 @@ async def main() -> None:
         )
         logger.info("Exchange initialized")
         
+        # Enforce single symbol limit
+        if len(config.trading.symbols) > 1:
+            logger.error("App supports strictly ONE symbol at a time.")
+            logger.error(f"Found {len(config.trading.symbols)}: {config.trading.symbols}")
+            await exchange.close()
+            sys.exit(1)
+        
     except Exception as e:
         logger.error(f"Failed to initialize exchange: {e}")
         await exchange.close()
@@ -111,28 +120,68 @@ async def main() -> None:
     
     try:
         await position_manager.load_initial_positions()
-        logger.info(f"Loaded {len(position_manager.positions)} existing positions")
+        
+        # Log summary and details for each position
+        pos_count = len(position_manager.positions)
+        if pos_count == 0:
+            logger.info("No existing positions found")
+        else:
+            logger.info(f"Loaded {pos_count} existing position(s) [READ-ONLY]:")
+            for pos in position_manager.get_all_positions():
+                logger.info(
+                    f"  → {pos.symbol}: {pos.side.upper()} "
+                    f"{pos.contracts:.4f} @ {pos.entry_price:.4f}"
+                )
         
     except Exception as e:
         logger.error(f"Failed to load positions: {e}")
         await exchange.close()
         sys.exit(1)
     
-    # Initialize signal processor
+    # Initialize Websocket Manager (Singleton)
+    ws_manager = WebsocketManager.get_instance(exchange)
+    
+    try:
+        await ws_manager.start(config.trading.symbols)
+        logger.info("Websocket manager started")
+        
+    except Exception as e:
+        logger.error(f"Failed to start websocket manager: {e}")
+        await exchange.close()
+        sys.exit(1)
+    
+    # Initialize chase order manager (singleton)
+    # Requires ws_manager for dependency injection
+    chase_manager = ChaseOrderManager.get_instance(exchange, ws_manager)
+    
+    try:
+        # Start chase manager (command processor)
+        await chase_manager.start()
+        logger.info("Chase order manager started")
+        
+    except Exception as e:
+        logger.error(f"Failed to start chase manager: {e}")
+        await exchange.close()
+        sys.exit(1)
+    
+    # Initialize signal processor (uses chase orders for entries/exits)
     signal_processor = SignalProcessor(
         exchange_client=exchange,
         position_manager=position_manager,
+        chase_manager=chase_manager,
         deposit_size=config.position_sizing.deposit_size,
         r_percentage=config.position_sizing.r_percentage,
         leverage=config.trading.leverage,
+        use_chase_orders=config.execution.use_chase_orders,
+        chase_mode=config.execution.chase_mode,
+        max_chase_retries=config.execution.max_chase_retries,
     )
     
-    # Initialize ZMQ listener
-    zmq_listener = ZmqListener(
+    # Initialize NATS listener
+    nats_listener = NatsListener(
         signal_processor=signal_processor,
-        host=config.zmq.host,
-        port=config.zmq.port,
-        topic=config.zmq.topic,
+        url=config.nats.url,
+        subject=config.nats.subject,
     )
     
     # Create background tasks
@@ -142,8 +191,8 @@ async def main() -> None:
             name="position_watcher"
         ),
         asyncio.create_task(
-            zmq_listener.start(),
-            name="zmq_listener"
+            nats_listener.start(),
+            name="nats_listener"
         ),
     ]
     
@@ -164,7 +213,11 @@ async def main() -> None:
         logger.info("Shutting down...")
         
         position_manager.stop()
-        zmq_listener.stop()
+        nats_listener.stop()
+        await chase_manager.shutdown()
+        await ws_manager.stop()
+        ChaseOrderManager.reset_instance()
+        WebsocketManager.reset_instance()
         
         # Cancel all tasks
         for task in tasks:

@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.models import ChaseOrderConfig
 
 
@@ -39,15 +40,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
 async def run_chase_order() -> None:
     """
     Run a chase limit order example.
     
     Uses singleton pattern with warmup for low-latency execution.
     """
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Run chase limit order example")
+    parser.add_argument(
+        "--side", 
+        type=str, 
+        choices=["long", "short"], 
+        default="long",
+        help="Position side to open/manage (long or short)"
+    )
+    args = parser.parse_args()
+
     # Configuration
     SYMBOL = "SOL/USDT:USDT"
     ORDER_SIZE_USDT = 5.0  # Minimum notional on Phemex
+    
+    # Determine sides based on argument
+    position_side = args.side.lower()  # 'long' or 'short'
+    # For opening new positions:
+    # Long = Buy
+    # Short = Sell
+    order_side = "buy" if position_side == "long" else "sell"
     
     logger.info("=" * 70)
     logger.info("CHASE LIMIT ORDER EXAMPLE (Singleton Pattern)")
@@ -73,15 +95,21 @@ async def run_chase_order() -> None:
             leverage=config.trading.leverage,
         )
         
-        # Get singleton chase manager
-        chase_manager = ChaseOrderManager.get_instance(client)
+        # Get singleton websocket manager
+        ws_manager = WebsocketManager.get_instance(client)
         
-        # Warmup: establish WS connections and start price streaming
-        logger.info("\nWarming up ChaseOrderManager...")
-        await chase_manager.warmup([SYMBOL])
+        # Start WS streaming
+        logger.info("\nStarting WebsocketManager...")
+        await ws_manager.start([SYMBOL])
+        
+        # Get singleton chase manager
+        chase_manager = ChaseOrderManager.get_instance(client, ws_manager)
+        
+        # Start chase manager
+        await chase_manager.start()
         
         # Get current cached prices
-        prices = chase_manager.get_prices(SYMBOL)
+        prices = ws_manager.get_prices(SYMBOL)
         if prices:
             logger.info(f"\nCached Prices (real-time from WS):")
             logger.info(f"  Bid1: ${prices['bid1']:.4f}")
@@ -94,22 +122,21 @@ async def run_chase_order() -> None:
         
         # Create chase order config
         # NOTE: position_side is required for accounts in hedge mode
-        # Set to 'long' for buy orders opening/managing a long position
-        # Set to 'short' for sell orders opening/managing a short position
         chase_config = ChaseOrderConfig(
             symbol=SYMBOL,
-            side="buy",
+            side=order_side,
             amount=order_amount,
             # chase_mode defaults to bid2 for buys (one tick back from top)
             max_chase_distance=2.0,    # Stop if price moves $2 from start
             max_retries=50,            # Max 50 order updates
             reduce_only=False,
-            position_side="long",      # Required for hedge mode accounts
+            position_side=position_side,      # Required for hedge mode accounts
         )
         
         logger.info(f"\nChase Order Config:")
         logger.info(f"  Symbol: {chase_config.symbol}")
         logger.info(f"  Side: {chase_config.side.upper()}")
+        logger.info(f"  Position Side: {chase_config.position_side.upper()}")
         logger.info(f"  Amount: {chase_config.amount:.4f} SOL (~${ORDER_SIZE_USDT})")
         logger.info(f"  Mode: {chase_config.chase_mode or 'default (bid2/ask2)'}")
         logger.info(f"  Max Chase Distance: ${chase_config.max_chase_distance}")
@@ -131,7 +158,7 @@ async def run_chase_order() -> None:
                 break
             
             # Log current prices
-            prices = chase_manager.get_prices(SYMBOL)
+            prices = ws_manager.get_prices(SYMBOL)
             if prices:
                 logger.info(
                     f"Status: {status['status']} | "
@@ -159,9 +186,12 @@ async def run_chase_order() -> None:
     finally:
         if chase_manager:
             await chase_manager.shutdown()
+        if 'ws_manager' in locals() and ws_manager:
+            await ws_manager.stop()
         await client.close()
         # Reset singleton for next run
         ChaseOrderManager.reset_instance()
+        WebsocketManager.reset_instance()
         logger.info("\nDone!")
 
 

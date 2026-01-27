@@ -1,13 +1,13 @@
 # src/phemex_client/models.py
-# Data models for ZMQ messages, positions, orders, and chase orders
+# Data models for trading signals, positions, orders, and chase orders
 # Provides type-safe dataclasses for all core data structures
 # RELEVANT FILES: config.py, signal_processor.py, chase_order_manager.py
 
 """
-Data models for Phemex ZMQ Order Listener.
+Data models for Phemex NATS Order Listener.
 
 Defines:
-- ZmqMessage: Parsed ZMQ trading signal
+- SignalMessage: Parsed trading signal
 - PositionState: Real-time position tracking
 - OrderResult: Order execution result
 - ChaseOrderConfig: Chase order parameters
@@ -42,11 +42,11 @@ class TpLevel:
 
 
 @dataclass
-class ZmqMessage:
+class SignalMessage:
     """
-    Parsed ZMQ trading signal message.
+    Parsed trading signal message.
     
-    Contains all fields from the ZMQ message protocol.
+    Contains all fields from the signal protocol.
     """
     # Required fields
     direction: Direction
@@ -75,9 +75,9 @@ class ZmqMessage:
     move_sl_to_be: bool = False
     
     @classmethod
-    def from_dict(cls, data: dict) -> "ZmqMessage":
+    def from_dict(cls, data: dict) -> "SignalMessage":
         """
-        Create ZmqMessage from dictionary (parsed JSON).
+        Create SignalMessage from dictionary (parsed JSON).
         
         Handles type conversion and defaults.
         """
@@ -229,6 +229,12 @@ class ChaseOrderConfig:
     # - Set to 'short' when opening/managing a short position
     # - Leave as None for one-way mode accounts
     position_side: Optional[str] = None
+    
+    # Advanced Order Params (SL/TP)
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    sl_trigger: str = "ByMarkPrice"  # ByMarkPrice, ByLastPrice
+    tp_trigger: str = "ByMarkPrice"
 
 
 @dataclass

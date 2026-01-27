@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from phemex_client.config import load_config
 from phemex_client.exchange_client import PhemexClient
 from phemex_client.chase_order_manager import ChaseOrderManager
+from phemex_client.websocket_manager import WebsocketManager
 from phemex_client.models import ChaseOrderConfig
 
 
@@ -42,10 +43,26 @@ async def close_position_with_chase() -> None:
     """
     Scan for active position and close it using chase order.
     """
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Close active position with chase order")
+    parser.add_argument(
+        "--side", 
+        type=str, 
+        choices=["long", "short"], 
+        default="long",
+        help="Position side to close (long or short)"
+    )
+    args = parser.parse_args()
+    
+    target_side = args.side.lower()
+    
     SYMBOL = "SOL/USDT:USDT"
     
     logger.info("=" * 70)
     logger.info("CLOSE POSITION WITH CHASE ORDER")
+    logger.info(f"Target Side: {target_side.upper()}")
     logger.info("=" * 70)
     
     # Load config
@@ -76,13 +93,16 @@ async def close_position_with_chase() -> None:
         position = None
         for pos in positions:
             if pos.get("symbol") == SYMBOL:
+                pos_side = pos.get("side", "").lower()
                 contracts = float(pos.get("contracts", 0))
-                if abs(contracts) > 0:
+                
+                # Only select if it matches our target side and has size
+                if abs(contracts) > 0 and pos_side == target_side:
                     position = pos
                     break
         
         if not position:
-            logger.info("✓ No active position found. Nothing to close.")
+            logger.info(f"✓ No active {target_side.upper()} position found. Nothing to close.")
             return
         
         # Extract position details
@@ -108,15 +128,21 @@ async def close_position_with_chase() -> None:
             close_side = "buy"
             position_side = "short"
         
-        # Get singleton chase manager
-        chase_manager = ChaseOrderManager.get_instance(client)
+        # Get singleton websocket manager
+        ws_manager = WebsocketManager.get_instance(client)
         
-        # Warmup: establish WS connections
-        logger.info("\nWarming up ChaseOrderManager...")
-        await chase_manager.warmup([SYMBOL])
+        # Start WS streaming
+        logger.info("\nStarting WebsocketManager...")
+        await ws_manager.start([SYMBOL])
+        
+        # Get singleton chase manager
+        chase_manager = ChaseOrderManager.get_instance(client, ws_manager)
+        
+        # Start chase manager
+        await chase_manager.start()
         
         # Get current cached prices
-        prices = chase_manager.get_prices(SYMBOL)
+        prices = ws_manager.get_prices(SYMBOL)
         if prices:
             logger.info(f"\nCurrent Market:")
             logger.info(f"   Bid1: ${prices['bid1']:.4f}")
@@ -158,7 +184,7 @@ async def close_position_with_chase() -> None:
                 break
             
             # Log current status
-            prices = chase_manager.get_prices(SYMBOL)
+            prices = ws_manager.get_prices(SYMBOL)
             if prices:
                 ref_price = prices['ask1'] if close_side == 'sell' else prices['bid1']
                 logger.info(
@@ -188,8 +214,11 @@ async def close_position_with_chase() -> None:
     finally:
         if chase_manager:
             await chase_manager.shutdown()
+        if 'ws_manager' in locals() and ws_manager:
+            await ws_manager.stop()
         await client.close()
         ChaseOrderManager.reset_instance()
+        WebsocketManager.reset_instance()
         logger.info("\nDone!")
 
 

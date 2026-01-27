@@ -18,8 +18,29 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from phemex_client.signal_processor import SignalProcessor
+from phemex_client.signal_processor import SignalProcessor, normalize_symbol_for_phemex
 from phemex_client.models import PositionState, OrderResult
+
+
+class TestSymbolNormalization:
+    """Tests for symbol format conversion."""
+    
+    def test_zmq_format_to_phemex(self):
+        """Test converting ZMQ format (SOL_USDT) to Phemex format (SOL/USDT:USDT)."""
+        assert normalize_symbol_for_phemex("SOL_USDT") == "SOL/USDT:USDT"
+        assert normalize_symbol_for_phemex("BTC_USDT") == "BTC/USDT:USDT"
+        assert normalize_symbol_for_phemex("ETH_USDT") == "ETH/USDT:USDT"
+    
+    def test_already_normalized_remains_unchanged(self):
+        """Test that already normalized symbols are not modified."""
+        assert normalize_symbol_for_phemex("SOL/USDT:USDT") == "SOL/USDT:USDT"
+        assert normalize_symbol_for_phemex("BTC/USDT:USDT") == "BTC/USDT:USDT"
+    
+    def test_partial_normalization(self):
+        """Test symbols that are partially normalized."""
+        # Has slash but no :USDT suffix
+        assert normalize_symbol_for_phemex("SOL/USDT") == "SOL/USDT:USDT"
+        assert normalize_symbol_for_phemex("BTC/USDT") == "BTC/USDT:USDT"
 
 
 class TestPositionSizing:
@@ -28,14 +49,19 @@ class TestPositionSizing:
     def setup_method(self):
         """Set up test fixtures."""
         self.exchange = MagicMock()
+        # Mock the step size lookup to return 0.01 (like SOL)
+        self.exchange.get_amount_step_size = MagicMock(return_value=0.01)
         self.position_manager = MagicMock()
         
+        self.chase_manager = MagicMock()
         self.processor = SignalProcessor(
             exchange_client=self.exchange,
             position_manager=self.position_manager,
+            chase_manager=self.chase_manager,
             deposit_size=1000.0,
             r_percentage=0.01,  # 1% = 10 USDT per R
             leverage=20,
+            use_chase_orders=True,
         )
     
     def test_basic_position_size(self):
@@ -43,6 +69,7 @@ class TestPositionSizing:
         # 10 R = 100 USDT notional
         # At price 100, that's 1.0 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=100.0,
             stop_loss=99.0,
             position_size_r=10.0,
@@ -55,6 +82,7 @@ class TestPositionSizing:
         # 10 R = 100 USDT notional
         # At price 50, that's 2.0 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=50.0,
             stop_loss=49.0,
             position_size_r=10.0,
@@ -68,6 +96,7 @@ class TestPositionSizing:
         # Max is 1000 * 20 * 0.95 = 19000 USDT
         # At price 100, max is 190 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=100.0,
             stop_loss=99.0,
             position_size_r=2000.0,  # High enough to hit the cap
@@ -80,12 +109,30 @@ class TestPositionSizing:
         # 1 R = 10 USDT notional
         # At price 100, that's 0.1 contracts
         size = self.processor.calculate_position_size(
+            symbol="TEST/USDT:USDT",
             entry_price=100.0,
             stop_loss=99.0,
             position_size_r=1.0,
         )
         
         assert size == 0.1
+    
+    def test_position_size_with_different_step_size(self):
+        """Test position size with different step sizes (e.g., AAVE=0.1)."""
+        # Mock AAVE-like step size
+        self.exchange.get_amount_step_size.return_value = 0.1
+        
+        # 10 R = 100 USDT notional
+        # At price 100, raw = 1.0 contracts
+        # With step 0.1, still 1.0
+        size = self.processor.calculate_position_size(
+            symbol="AAVE/USDT:USDT",
+            entry_price=100.0,
+            stop_loss=99.0,
+            position_size_r=10.0,
+        )
+        
+        assert size == 1.0
 
 
 class TestEntrySignal:
@@ -114,16 +161,25 @@ class TestEntrySignal:
             )
         )
         self.exchange.cancel_all_orders = AsyncMock(return_value=[])
+        # Mock step size lookup for position sizing
+        self.exchange.get_amount_step_size = MagicMock(return_value=0.01)
         
         self.position_manager = MagicMock()
         self.position_manager.get_position = MagicMock(return_value=None)
         
+        self.chase_manager = MagicMock()
+        self.chase_manager.submit_chase_and_wait = AsyncMock(
+            return_value=MagicMock(status="filled", total_filled=0.1, fill_price=43000.0)
+        )
+        
         self.processor = SignalProcessor(
             exchange_client=self.exchange,
             position_manager=self.position_manager,
+            chase_manager=self.chase_manager,
             deposit_size=1000.0,
             r_percentage=0.01,
             leverage=20,
+            use_chase_orders=True,
         )
     
     @pytest.mark.asyncio
@@ -135,22 +191,50 @@ class TestEntrySignal:
             "symbol": "BTC/USDT:USDT",
             "price": 43000.0,
             "stop_loss": 42500.0,
-            "position_size_r": 10.0,
+            "position_size_r": 500.0,
             "timestamp": "2024-01-15T10:30:00Z",
         }
         
         await self.processor.process_signal(message)
         
         # Verify entry order placed
-        self.exchange.place_limit_post_only.assert_called_once()
-        call_kwargs = self.exchange.place_limit_post_only.call_args.kwargs
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
         
-        assert call_kwargs["symbol"] == "BTC/USDT:USDT"
-        assert call_kwargs["side"] == "buy"
-        assert call_kwargs["price"] == 43000.0
+        assert config.symbol == "BTC/USDT:USDT"
+        assert config.side == "buy"
+        assert config.stop_loss == 42500.0
         
-        # Verify stop-loss placed
-        self.exchange.place_stop_loss_market.assert_called_once()
+        # Verify stop-loss NOT placed as separate order
+        self.exchange.place_stop_loss_market.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_entry_with_zmq_symbol_format(self):
+        """Test ENTRY with ZMQ format symbol (SOL_USDT) gets normalized to Phemex format."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "SOL_USDT",  # ZMQ format (underscore)
+            "price": 130.0,
+            "stop_loss": 128.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify the symbol was normalized to Phemex format
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
+        
+        # Should be converted to SOL/USDT:USDT
+        assert config.symbol == "SOL/USDT:USDT"
+        assert config.side == "buy"
+        assert config.stop_loss == 128.0
+        
+        # Verify separate stop-loss NOT called
+        self.exchange.place_stop_loss_market.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_entry_short_no_position(self):
@@ -161,19 +245,21 @@ class TestEntrySignal:
             "symbol": "BTC/USDT:USDT",
             "price": 43000.0,
             "stop_loss": 43500.0,
-            "position_size_r": 10.0,
+            "position_size_r": 500.0,
             "timestamp": "2024-01-15T10:30:00Z",
         }
         
         await self.processor.process_signal(message)
         
         # Verify entry order placed with sell side
-        call_kwargs = self.exchange.place_limit_post_only.call_args.kwargs
-        assert call_kwargs["side"] == "sell"
+        # Verify entry order placed with sell side
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
+        assert config.side == "sell"
+        assert config.stop_loss == 43500.0
         
-        # Verify stop-loss side is buy (to close short)
-        sl_kwargs = self.exchange.place_stop_loss_market.call_args.kwargs
-        assert sl_kwargs["side"] == "buy"
+        # Verify separate stop-loss NOT called
+        self.exchange.place_stop_loss_market.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_entry_ignored_same_direction(self):
@@ -197,11 +283,16 @@ class TestEntrySignal:
         await self.processor.process_signal(message)
         
         # Verify no orders placed
-        self.exchange.place_limit_post_only.assert_not_called()
+        self.chase_manager.submit_chase_and_wait.assert_not_called()
     
     @pytest.mark.asyncio
-    async def test_entry_closes_opposite_position(self):
-        """Test ENTRY closes opposite position first."""
+    async def test_entry_ignored_when_opposite_position_exists(self):
+        """Test ENTRY ignored when opposite position exists.
+        
+        Changed behavior: ENTRY signals are now ignored when ANY position
+        exists for the symbol. This prevents opening new positions while
+        one is already active (use EXIT first, then new ENTRY).
+        """
         # Mock existing short position
         self.position_manager.get_position.return_value = PositionState(
             symbol="BTC/USDT:USDT",
@@ -216,16 +307,180 @@ class TestEntrySignal:
             "direction": "LONG",  # Opposite of existing
             "symbol": "BTC/USDT:USDT",
             "price": 43000.0,
+            "position_size_r": 500.0,
             "timestamp": "2024-01-15T10:30:00Z",
         }
         
         await self.processor.process_signal(message)
         
-        # Verify cancel and close orders called
-        self.exchange.cancel_all_orders.assert_called()
+        # Verify no orders placed - entry is ignored when position exists
+        self.chase_manager.submit_chase_and_wait.assert_not_called()
+
+
+class TestMultiTpEntry:
+    """Tests for ENTRY signal with multi-TP functionality."""
+    
+    def setup_method(self):
+        """Set up test fixtures with async mocks."""
+        self.exchange = MagicMock()
+        self.exchange.place_limit_post_only = AsyncMock(
+            return_value=OrderResult(
+                order_id="tp-123",
+                symbol="BTC/USDT:USDT",
+                side="sell",
+                order_type="limit",
+                amount=0.05,
+                price=44000.0,
+            )
+        )
+        self.exchange.cancel_all_orders = AsyncMock(return_value=[])
+        self.exchange.get_amount_step_size = MagicMock(return_value=0.01)
         
-        # Should have 2 calls: close + new entry
-        assert self.exchange.place_limit_post_only.call_count == 2
+        self.position_manager = MagicMock()
+        self.position_manager.get_position = MagicMock(return_value=None)
+        self.position_manager.mark_as_managed = MagicMock()
+        
+        self.chase_manager = MagicMock()
+        # Mock successful entry fill
+        self.chase_manager.submit_chase_and_wait = AsyncMock(
+            return_value=MagicMock(
+                status="filled",
+                total_filled=0.1,
+                fill_price=43000.0
+            )
+        )
+        
+        self.processor = SignalProcessor(
+            exchange_client=self.exchange,
+            position_manager=self.position_manager,
+            chase_manager=self.chase_manager,
+            deposit_size=1000.0,
+            r_percentage=0.01,
+            leverage=20,
+            use_chase_orders=True,
+        )
+    
+    @pytest.mark.asyncio
+    async def test_entry_with_multi_tp_places_limit_orders(self):
+        """Test ENTRY with multi_tp_enabled places limit close orders for each TP level."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 42500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": True,
+            "tp_levels": [
+                {"ratio": 1.2, "price": 43500.0, "exit_pct": 0.5},
+                {"ratio": 2.0, "price": 44000.0, "exit_pct": 0.3},
+                {"ratio": 3.0, "price": 44500.0, "exit_pct": 0.2},
+            ],
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        
+        # Verify position marked as managed
+        self.position_manager.mark_as_managed.assert_called_once_with("BTC/USDT:USDT")
+        
+        # Verify limit TP orders placed (3 calls)
+        assert self.exchange.place_limit_post_only.call_count == 3
+        
+        # Check each TP order
+        calls = self.exchange.place_limit_post_only.call_args_list
+        
+        # TP1: 50% at 43500
+        assert calls[0].kwargs["symbol"] == "BTC/USDT:USDT"
+        assert calls[0].kwargs["side"] == "sell"  # Closing LONG
+        assert calls[0].kwargs["price"] == 43500.0
+        assert abs(calls[0].kwargs["amount"] - 0.05) < 0.001  # 0.1 * 0.5
+        assert calls[0].kwargs["reduce_only"] is True
+        assert calls[0].kwargs["position_side"] == "long"
+        
+        # TP2: 30% at 44000
+        assert calls[1].kwargs["price"] == 44000.0
+        assert abs(calls[1].kwargs["amount"] - 0.03) < 0.001  # 0.1 * 0.3
+        
+        # TP3: 20% at 44500
+        assert calls[2].kwargs["price"] == 44500.0
+        assert abs(calls[2].kwargs["amount"] - 0.02) < 0.001  # 0.1 * 0.2
+    
+    @pytest.mark.asyncio
+    async def test_entry_short_with_multi_tp(self):
+        """Test SHORT entry with multi-TP uses correct order side (buy to close)."""
+        message = {
+            "action": "ENTRY",
+            "direction": "SHORT",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 43500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": True,
+            "tp_levels": [
+                {"ratio": 1.2, "price": 42500.0, "exit_pct": 0.5},
+                {"ratio": 2.0, "price": 42000.0, "exit_pct": 0.5},
+            ],
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify TP orders use BUY side (closing SHORT)
+        calls = self.exchange.place_limit_post_only.call_args_list
+        assert calls[0].kwargs["side"] == "buy"
+        assert calls[0].kwargs["position_side"] == "short"
+    
+    @pytest.mark.asyncio
+    async def test_entry_without_multi_tp_skips_limit_orders(self):
+        """Test ENTRY without multi_tp_enabled does NOT place limit TP orders."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 42500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": False,  # Disabled
+            "tp_levels": [
+                {"ratio": 1.2, "price": 43500.0, "exit_pct": 0.5},
+            ],
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        
+        # Verify NO limit TP orders placed
+        self.exchange.place_limit_post_only.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_entry_with_empty_tp_levels_skips_limit_orders(self):
+        """Test ENTRY with multi_tp_enabled but empty tp_levels skips limit orders."""
+        message = {
+            "action": "ENTRY",
+            "direction": "LONG",
+            "symbol": "BTC/USDT:USDT",
+            "price": 43000.0,
+            "stop_loss": 42500.0,
+            "position_size_r": 500.0,
+            "timestamp": "2024-01-15T10:30:00Z",
+            "multi_tp_enabled": True,
+            "tp_levels": [],  # Empty
+        }
+        
+        await self.processor.process_signal(message)
+        
+        # Verify entry order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
+        
+        # Verify NO limit TP orders placed
+        self.exchange.place_limit_post_only.assert_not_called()
 
 
 class TestExitSignal:
@@ -248,9 +503,16 @@ class TestExitSignal:
         self.position_manager = MagicMock()
         self.position_manager.clear_position = MagicMock()
         
+        self.chase_manager = MagicMock()
+        self.chase_manager.submit_chase_and_wait = AsyncMock(
+            return_value=MagicMock(status="filled", total_filled=0.1, fill_price=44000.0)
+        )
+        
         self.processor = SignalProcessor(
             exchange_client=self.exchange,
             position_manager=self.position_manager,
+            chase_manager=self.chase_manager,
+            use_chase_orders=True,
         )
     
     @pytest.mark.asyncio
@@ -276,12 +538,13 @@ class TestExitSignal:
         await self.processor.process_signal(message)
         
         # Verify orders cancelled and close placed
+        # Verify orders cancelled and close placed
         self.exchange.cancel_all_orders.assert_called()
-        self.exchange.place_limit_post_only.assert_called_once()
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
         
-        call_kwargs = self.exchange.place_limit_post_only.call_args.kwargs
-        assert call_kwargs["side"] == "sell"
-        assert call_kwargs["reduce_only"] is True
+        config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
+        assert config.side == "sell"
+        assert config.reduce_only is True
     
     @pytest.mark.asyncio
     async def test_exit_no_position(self):
@@ -299,7 +562,7 @@ class TestExitSignal:
         await self.processor.process_signal(message)
         
         # Verify no orders placed
-        self.exchange.place_limit_post_only.assert_not_called()
+        self.chase_manager.submit_chase_and_wait.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_exit_read_only_blocked(self):
@@ -323,7 +586,7 @@ class TestExitSignal:
         await self.processor.process_signal(message)
         
         # Verify no orders placed
-        self.exchange.place_limit_post_only.assert_not_called()
+        self.chase_manager.submit_chase_and_wait.assert_not_called()
 
 
 class TestPartialExitSignal:
@@ -354,9 +617,16 @@ class TestPartialExitSignal:
         
         self.position_manager = MagicMock()
         
+        self.chase_manager = MagicMock()
+        self.chase_manager.submit_chase_and_wait = AsyncMock(
+            return_value=MagicMock(status="filled", total_filled=0.033, fill_price=43500.0)
+        )
+        
         self.processor = SignalProcessor(
             exchange_client=self.exchange,
             position_manager=self.position_manager,
+            chase_manager=self.chase_manager,
+            use_chase_orders=True,
         )
     
     @pytest.mark.asyncio
@@ -383,12 +653,13 @@ class TestPartialExitSignal:
         await self.processor.process_signal(message)
         
         # Verify partial close order placed
-        self.exchange.place_limit_post_only.assert_called_once()
+        # Verify partial close order placed
+        self.chase_manager.submit_chase_and_wait.assert_called_once()
         
-        call_kwargs = self.exchange.place_limit_post_only.call_args.kwargs
-        assert call_kwargs["reduce_only"] is True
+        config = self.chase_manager.submit_chase_and_wait.call_args[0][0]
+        assert config.reduce_only is True
         # 0.1 * 0.33 = 0.033
-        assert abs(call_kwargs["amount"] - 0.033) < 0.001
+        assert abs(config.amount - 0.033) < 0.001
     
     @pytest.mark.asyncio
     async def test_partial_exit_moves_sl_to_be(self):

@@ -1,5 +1,5 @@
 # config.example.yml
-# Phemex ZMQ Order Listener - Configuration
+# Phemex NATS Order Listener - Configuration
 # Copy this file to config.yml and fill in your values
 
 # Phemex API credentials
@@ -8,11 +8,10 @@ phemex:
   secret: "your_api_secret_here"
   testnet: false
 
-# ZeroMQ settings
-zmq:
-  host: "127.0.0.1"
-  port: 5555
-  topic: "orders"
+# NATS settings
+nats:
+  url: "nats://localhost:4222"
+  subject: "orders"
 
 # Position sizing
 position_sizing:
@@ -22,6 +21,11 @@ position_sizing:
 # Trading settings
 trading:
   symbols:
-    - "BTC/USDT:USDT"
     - "SOL/USDT:USDT"
   leverage: 20
+
+# Execution settings
+execution:
+  use_chase_orders: false   # If true, use limit chase. If false, use market orders.
+  chase_mode: "bid2"        # bid1, bid2, ask1, ask2, distance
+  max_chase_retries: 50     # Max number of price updates before giving up

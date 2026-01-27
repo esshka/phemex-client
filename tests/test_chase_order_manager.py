@@ -33,8 +33,9 @@ class TestSingletonPattern:
         """Test get_instance returns same instance."""
         exchange = MagicMock()
         
-        instance1 = ChaseOrderManager.get_instance(exchange)
-        instance2 = ChaseOrderManager.get_instance(exchange)
+        ws_manager = MagicMock()
+        instance1 = ChaseOrderManager.get_instance(exchange, ws_manager)
+        instance2 = ChaseOrderManager.get_instance(exchange, ws_manager)
         
         assert instance1 is instance2
     
@@ -43,9 +44,9 @@ class TestSingletonPattern:
         exchange1 = MagicMock()
         exchange2 = MagicMock()
         
-        instance1 = ChaseOrderManager.get_instance(exchange1)
+        instance1 = ChaseOrderManager.get_instance(exchange1, MagicMock())
         ChaseOrderManager.reset_instance()
-        instance2 = ChaseOrderManager.get_instance(exchange2)
+        instance2 = ChaseOrderManager.get_instance(exchange2, MagicMock())
         
         assert instance1 is not instance2
 
@@ -56,7 +57,8 @@ class TestPriceCalculation:
     def setup_method(self):
         """Set up test fixtures."""
         self.exchange = MagicMock()
-        self.manager = ChaseOrderManager(self.exchange)
+        self.ws_manager = MagicMock()
+        self.manager = ChaseOrderManager(self.exchange, self.ws_manager)
         # Standard prices dict for tests
         self.prices = {
             "bid1": 100.0,
@@ -201,7 +203,8 @@ class TestChaseState:
     def setup_method(self):
         """Set up test fixtures."""
         self.exchange = MagicMock()
-        self.manager = ChaseOrderManager(self.exchange)
+        self.ws_manager = MagicMock()
+        self.manager = ChaseOrderManager(self.exchange, self.ws_manager)
     
     def teardown_method(self):
         ChaseOrderManager.reset_instance()
@@ -329,7 +332,8 @@ class TestGetStatus:
     
     def setup_method(self):
         self.exchange = MagicMock()
-        self.manager = ChaseOrderManager(self.exchange)
+        self.ws_manager = MagicMock()
+        self.manager = ChaseOrderManager(self.exchange, self.ws_manager)
     
     def teardown_method(self):
         ChaseOrderManager.reset_instance()
@@ -364,44 +368,41 @@ class TestGetStatus:
         status = self.manager.get_chase_status("unknown")
         assert status is None
     
-    def test_get_prices_returns_cached(self):
-        """Test get_prices returns cached prices."""
-        self.manager._prices["SOL/USDT:USDT"] = {
-            "bid1": 100.0,
-            "ask1": 100.5,
-        }
-        
-        prices = self.manager.get_prices("SOL/USDT:USDT")
-        
-        assert prices["bid1"] == 100.0
-        assert prices["ask1"] == 100.5
-    
-    def test_get_prices_not_found(self):
-        """Test get_prices returns None for unknown symbol."""
-        prices = self.manager.get_prices("UNKNOWN")
-        assert prices is None
 
 
-class TestSubmitWithoutWarmup:
-    """Test submit_chase fails without warmup."""
+
+class TestChaseStartTruncatesAmount:
+    """Test start_chase truncates amount to step size."""
     
     def teardown_method(self):
         ChaseOrderManager.reset_instance()
     
     @pytest.mark.asyncio
-    async def test_submit_chase_requires_warmup(self):
-        """Test submit_chase fails without warmup."""
+    async def test_start_chase_truncates(self):
+        """Test start_chase truncates amount."""
         exchange = MagicMock()
-        manager = ChaseOrderManager(exchange)
+        manager = ChaseOrderManager.get_instance(exchange, MagicMock())
         
+        # 0.0363 -> should be truncated to 0.03
         config = ChaseOrderConfig(
             symbol="SOL/USDT:USDT",
             side="buy",
-            amount=1.0,
+            amount=0.0363,
         )
         
-        with pytest.raises(RuntimeError, match="not warmed up"):
-            await manager.submit_chase(config)
+        await manager.start()
+        chase_id = await manager.submit_chase(config)
+        
+        # Wait for command processor to pick it up (sleep briefly)
+        # The command processor runs _start_chase which does the truncation
+        await asyncio.sleep(0.1)
+        
+        state = manager._active_chases[chase_id]
+        
+        # Check if amount was updated in config
+        assert state.config.amount == 0.03
+        
+        await manager.shutdown()
 
 
 if __name__ == "__main__":

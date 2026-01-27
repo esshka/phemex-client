@@ -125,6 +125,28 @@ class PhemexClient:
         self._initialized = True
         logger.info(f"Exchange initialized for {len(symbols)} symbols")
     
+    def get_amount_step_size(self, symbol: str) -> float:
+        """
+        Get the minimum amount step size for a symbol.
+        
+        Each symbol has different precision requirements.
+        E.g., SOL=0.01, AAVE=0.1, BTC=0.001
+        
+        Args:
+            symbol: Trading symbol (e.g., 'AAVE/USDT:USDT')
+        
+        Returns:
+            Step size for amount (e.g., 0.1 for AAVE)
+        """
+        if symbol in self.exchange.markets:
+            market = self.exchange.markets[symbol]
+            precision = market.get("precision", {}).get("amount")
+            if precision is not None:
+                return float(precision)
+        
+        # Fallback default
+        return 0.01
+    
     async def place_limit_post_only(
         self,
         symbol: str,
@@ -133,6 +155,10 @@ class PhemexClient:
         price: float,
         reduce_only: bool = False,
         position_side: Optional[str] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        sl_trigger: str = "ByMarkPrice",
+        tp_trigger: str = "ByMarkPrice",
     ) -> OrderResult:
         """
         Place a limit post-only order.
@@ -160,6 +186,15 @@ class PhemexClient:
         # Add position side for hedge mode
         if position_side:
             params["posSide"] = position_side.capitalize()  # 'Long' or 'Short'
+            
+        # Add SL/TP if provided
+        if stop_loss:
+            params["stopLossRp"] = str(stop_loss)
+            params["slTrigger"] = sl_trigger
+            
+        if take_profit:
+            params["takeProfitRp"] = str(take_profit)
+            params["tpTrigger"] = tp_trigger
         
         # Truncate amount to minimum step size (0.01 for SOL)
         truncated_amount = truncate_to_step_size(amount)
@@ -198,10 +233,16 @@ class PhemexClient:
         Returns:
             OrderResult with order details
         """
+        # Phemex requires triggerDirection for conditional orders:
+        # - 'descending': triggers when price falls BELOW trigger_price (LONG SL)
+        # - 'ascending': triggers when price rises ABOVE trigger_price (SHORT SL)
+        trigger_direction = "descending" if side == "sell" else "ascending"
+        
         params = {
             "stopLossPrice": trigger_price,
             "triggerPrice": trigger_price,
             "triggerType": trigger_type,
+            "triggerDirection": trigger_direction,
             "reduceOnly": True,
         }
         
@@ -289,6 +330,10 @@ class PhemexClient:
         amount: Optional[float] = None,
         price: Optional[float] = None,
         position_side: Optional[str] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        sl_trigger: str = "ByMarkPrice",
+        tp_trigger: str = "ByMarkPrice",
     ) -> OrderResult:
         """
         Amend an existing order (change price and/or amount).
@@ -310,6 +355,15 @@ class PhemexClient:
             params = {}
             if position_side:
                 params["posSide"] = position_side.capitalize()
+                
+            # Add SL/TP if provided
+            if stop_loss:
+                params["stopLossRp"] = str(stop_loss)
+                params["slTrigger"] = sl_trigger
+                
+            if take_profit:
+                params["takeProfitRp"] = str(take_profit)
+                params["tpTrigger"] = tp_trigger
             
             # Truncate amount to minimum step size if provided
             truncated_amount = truncate_to_step_size(amount) if amount else None

@@ -74,31 +74,51 @@ class PositionManager:
     
     async def watch_positions(self) -> None:
         """
-        Continuously watch position updates via WebSocket.
+        Continuously poll position updates via REST API.
+        
+        Note: Phemex does not support WebSocket watch_positions(),
+        so we poll fetch_positions() every 5 seconds instead.
         
         Updates local state as positions change.
         Runs until stop() is called.
         """
         self._running = True
-        logger.info("Starting position watcher")
+        poll_interval = 5  # seconds
+        logger.info(f"Starting position poller (interval: {poll_interval}s)")
         
         while self._running:
             try:
-                positions = await self.exchange.watch_positions()
+                positions = await self.exchange.fetch_positions()
+                
+                # Track which symbols we've seen in this update
+                seen_symbols = set()
                 
                 for pos in positions:
-                    self._handle_position_update(pos)
+                    contracts = pos.get("contracts", 0) or 0
+                    if contracts > 0:
+                        self._handle_position_update(pos)
+                        seen_symbols.add(pos["symbol"])
+                
+                # Remove positions that are no longer present
+                # (position was closed externally)
+                for symbol in list(self.positions.keys()):
+                    if symbol not in seen_symbols:
+                        del self.positions[symbol]
+                        logger.info(f"Position closed (external): {symbol}")
+                
+                # Wait before next poll
+                await asyncio.sleep(poll_interval)
                     
             except asyncio.CancelledError:
-                logger.info("Position watcher cancelled")
+                logger.info("Position poller cancelled")
                 break
                 
             except Exception as e:
-                logger.error(f"Position watch error: {e}")
-                # Brief delay before retry
-                await asyncio.sleep(1)
+                logger.error(f"Position poll error: {e}")
+                # Brief delay before retry on error
+                await asyncio.sleep(poll_interval)
         
-        logger.info("Position watcher stopped")
+        logger.info("Position poller stopped")
     
     def _handle_position_update(self, pos: dict) -> None:
         """
